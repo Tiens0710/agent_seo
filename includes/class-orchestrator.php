@@ -1,0 +1,817 @@
+<?php
+/**
+ * Trình điều phối chính quy trình SEO (AI Orchestrator)
+ */
+
+defined('ABSPATH') || exit;
+
+class Agent_SEO_Orchestrator {
+
+    public function __construct() {
+        // Lắng nghe sự kiện chạy ngầm từ WP-Cron
+        add_action('agent_seo_cron_hook', array($this, 'run_single_task'));
+        add_action('agent_seo_background_task', array($this, 'run_background_task'), 10, 2);
+        add_action('agent_seo_image_retry_task', array($this, 'run_image_retry_task'), 10, 1);
+        add_action('agent_seo_inline_image_task', array($this, 'run_inline_image_task'), 10, 1);
+        add_action('agent_seo_index_notify_task', array($this, 'notify_indexnow'), 10, 1);
+        add_action('agent_seo_gsc_sitemap_task', array('Agent_SEO_GSC', 'submit_sitemap'));
+        
+        // Thêm lịch kiểm tra thay đổi chu kỳ Cron khi lưu cấu hình
+        add_action('update_option_aseo_cron_interval', array($this, 'reschedule_cron_on_update'), 10, 2);
+        add_action('transition_post_status', array($this, 'queue_index_notification'), 10, 3);
+        add_action('init', array($this, 'serve_indexnow_key'));
+    }
+
+    public function serve_indexnow_key() {
+        if (!isset($_GET['agent_seo_indexnow_key'])) {
+            return;
+        }
+        $key = trim(get_option('aseo_indexnow_key', ''));
+        if (empty($key)) {
+            status_header(404);
+            exit;
+        }
+        header('Content-Type: text/plain; charset=utf-8');
+        echo esc_html($key);
+        exit;
+    }
+
+    public function queue_index_notification($new_status, $old_status, $post) {
+        if ($new_status !== 'publish' || $old_status === 'publish' || empty($post->ID) || $post->post_type !== 'post') {
+            return;
+        }
+        if (!get_post_meta($post->ID, '_agent_seo_generated', true)) {
+            return;
+        }
+        if (!wp_next_scheduled('agent_seo_index_notify_task', array($post->ID))) {
+            wp_schedule_single_event(time() + 10, 'agent_seo_index_notify_task', array($post->ID));
+        }
+        if (!wp_next_scheduled('agent_seo_gsc_sitemap_task')) {
+            wp_schedule_single_event(time() + 15, 'agent_seo_gsc_sitemap_task');
+        }
+    }
+
+    public function notify_indexnow($post_id) {
+        $key = trim(get_option('aseo_indexnow_key', ''));
+        $url = get_permalink($post_id);
+        if (empty($key) || empty($url)) {
+            return;
+        }
+        $host = wp_parse_url(home_url('/'), PHP_URL_HOST);
+        $response = wp_remote_post('https://api.indexnow.org/indexnow', array(
+            'headers' => array('Content-Type' => 'application/json; charset=utf-8'),
+            'body' => wp_json_encode(array(
+                'host' => $host,
+                'key' => $key,
+                'keyLocation' => add_query_arg('agent_seo_indexnow_key', '1', home_url('/')),
+                'urlList' => array($url)
+            )),
+            'timeout' => 20
+        ));
+        if (!is_wp_error($response) && in_array(wp_remote_retrieve_response_code($response), array(200, 202), true)) {
+            update_post_meta($post_id, '_agent_seo_indexnow_sent_at', time());
+        } else {
+            error_log('Agent SEO IndexNow notification failed for post ID ' . intval($post_id));
+        }
+    }
+
+    /**
+     * Worker chạy một bài trong request WP-Cron riêng, tránh làm timeout trang quản trị.
+     */
+    public function run_background_task($requested_status = 'draft', $remaining = 1) {
+        @set_time_limit(360);
+        @ini_set('max_execution_time', '360');
+        // Prevent duplicate WP-Cron requests from generating the same batch.
+        if (get_transient('agent_seo_generation_lock')) {
+            $remaining = max(1, intval($remaining));
+            $args = array($requested_status, $remaining);
+            if (!wp_next_scheduled('agent_seo_background_task', $args)) {
+                wp_schedule_single_event(time() + 30, 'agent_seo_background_task', $args);
+            }
+            $locked_batch = get_option('aseo_batch_status', array());
+            if (is_array($locked_batch) && !empty($locked_batch['total'])) {
+                $locked_batch['status'] = 'waiting';
+                $locked_batch['remaining'] = $remaining;
+                $locked_batch['requested_status'] = $requested_status;
+                $locked_batch['message'] = 'Worker trước vẫn đang bận. Hệ thống sẽ tự thử lại sau 30 giây...';
+                $locked_batch['updated_at'] = time();
+                update_option('aseo_batch_status', $locked_batch, false);
+            }
+            return;
+        }
+        set_transient('agent_seo_generation_lock', time(), 900);
+        $remaining = max(1, intval($remaining));
+        $batch = get_option('aseo_batch_status', array());
+        if (is_array($batch) && isset($batch['total'])) {
+            $current = max(1, intval($batch['total']) - $remaining + 1);
+            $batch['status'] = 'running';
+            $batch['current'] = $current;
+            $batch['remaining'] = $remaining;
+            $batch['requested_status'] = $requested_status;
+            $batch['message'] = 'Đang viết nội dung và tạo ảnh cho bài ' . $current . '/' . intval($batch['total']) . '...';
+            $batch['updated_at'] = time();
+            update_option('aseo_batch_status', $batch, false);
+        }
+        $product_id_override = is_array($batch) && isset($batch['product_id']) ? absint($batch['product_id']) : 0;
+        $result = $this->run_single_task($requested_status, $product_id_override);
+        if (!$result['success']) {
+            if (is_array($batch)) {
+                $batch['status'] = 'failed';
+                $batch['message'] = 'Tác vụ bị lỗi: ' . $result['message'];
+                $batch['updated_at'] = time();
+                update_option('aseo_batch_status', $batch, false);
+            }
+            delete_transient('agent_seo_generation_lock');
+            error_log('Agent SEO Background Task Error: ' . $result['message']);
+            return;
+        }
+
+        $remaining = max(0, intval($remaining) - 1);
+        if (is_array($batch) && isset($batch['total'])) {
+            $batch['remaining'] = $remaining;
+            $batch['completed'] = max(intval(isset($batch['completed']) ? $batch['completed'] : 0), intval($batch['current']));
+            $batch['last_post_id'] = intval($result['post_id']);
+            $batch['last_title'] = sanitize_text_field($result['title']);
+            $batch['updated_at'] = time();
+            if (!empty($result['image_warning'])) {
+                $pending_images = isset($batch['pending_images']) && is_array($batch['pending_images']) ? $batch['pending_images'] : array();
+                $pending_images[] = intval($result['post_id']);
+                $batch['pending_images'] = array_values(array_unique($pending_images));
+            }
+            if ($remaining > 0) {
+                $batch['status'] = 'waiting';
+                $batch['message'] = 'Đã hoàn tất bài ' . intval($batch['completed']) . '/' . intval($batch['total']) . '. Đang chuẩn bị bài tiếp theo...';
+            } else {
+                $batch['completed'] = intval($batch['total']);
+                if (!empty($batch['pending_images'])) {
+                    $batch['status'] = 'images_pending';
+                    $batch['message'] = 'Đã viết xong ' . intval($batch['total']) . ' bài. Đang hoàn thiện ' . count($batch['pending_images']) . ' ảnh đại diện...';
+                } else {
+                    $batch['status'] = 'complete';
+                    $batch['message'] = 'Đã tạo xong toàn bộ ' . intval($batch['total']) . ' bài viết và ảnh đại diện.';
+                    $batch['finished_at'] = time();
+                }
+            }
+            update_option('aseo_batch_status', $batch, false);
+        }
+        if ($remaining > 0) {
+            // Chờ rất ngắn sau khi WordPress đã lưu xong bài/ảnh rồi mới bắt đầu bài tiếp theo.
+            wp_schedule_single_event(time() + 5, 'agent_seo_background_task', array($requested_status, $remaining));
+        }
+        delete_transient('agent_seo_generation_lock');
+    }
+
+    public function run_image_retry_task($post_id) {
+        @set_time_limit(600);
+        @ini_set('max_execution_time', '600');
+        $post_id = intval($post_id);
+        if (get_transient('agent_seo_generation_lock')) {
+            wp_schedule_single_event(time() + 120, 'agent_seo_image_retry_task', array($post_id));
+            return;
+        }
+        if ($post_id <= 0 || !get_post($post_id) || get_post_thumbnail_id($post_id)) {
+            if ($post_id > 0 && get_post_thumbnail_id($post_id)) {
+                $this->clear_image_job($post_id);
+                $this->mark_batch_image_finished($post_id, true);
+            }
+            return;
+        }
+        $job = get_post_meta($post_id, '_agent_seo_image_job', true);
+        if (!is_array($job) || empty($job['prompt'])) {
+            return;
+        }
+        $attempts = intval(get_post_meta($post_id, '_agent_seo_image_attempts', true)) + 1;
+        update_post_meta($post_id, '_agent_seo_image_attempts', $attempts);
+        $attach_id = $this->generate_featured_image($post_id, $job);
+        $ai_image_success = $this->ensure_featured_image($post_id, $attach_id);
+        
+        $fallback_product_image_id = !empty($job['product_image_id'])
+            ? absint($job['product_image_id'])
+            : (!empty($job['product_image']) && function_exists('attachment_url_to_postid')
+                ? absint(attachment_url_to_postid($job['product_image'])) : 0);
+                
+        if (!$ai_image_success && $fallback_product_image_id > 0) {
+            $this->ensure_featured_image($post_id, $fallback_product_image_id);
+        }
+        
+        if ($ai_image_success) {
+            $this->clear_image_job($post_id);
+            $this->mark_batch_image_finished($post_id, true);
+        } elseif ($attempts < 3) {
+            wp_schedule_single_event(time() + 30, 'agent_seo_image_retry_task', array($post_id));
+        } else {
+            $this->clear_image_job($post_id); // Dọn dẹp job sau khi hết số lần thử mà vẫn lỗi AI
+            $this->mark_batch_image_finished($post_id, false);
+        }
+    }
+
+    /** Tạo từng ảnh minh họa và chèn vào bài sau khi ảnh đại diện đã xong. */
+    public function run_inline_image_task($post_id) {
+        @set_time_limit(360);
+        $post_id = absint($post_id);
+        if ($post_id <= 0 || !get_post($post_id) || get_transient('agent_seo_inline_image_lock_' . $post_id)) {
+            return;
+        }
+        $job = get_post_meta($post_id, '_agent_seo_inline_image_job', true);
+        if (!is_array($job) || empty($job['prompt'])) {
+            $job = get_post_meta($post_id, '_agent_seo_image_job', true);
+        }
+        $featured_id = get_post_thumbnail_id($post_id);
+        $inline_ids = get_post_meta($post_id, '_agent_seo_inline_image_ids', true);
+        $inline_ids = is_array($inline_ids) ? array_values(array_filter(array_map('absint', $inline_ids))) : array();
+        if (!is_array($job) || empty($job['prompt']) || count($inline_ids) >= 2) {
+            return;
+        }
+        set_transient('agent_seo_inline_image_lock_' . $post_id, 1, 600);
+        $variant_index = count($inline_ids) + 1;
+        $variant_prompts = array(
+            1 => "INLINE ILLUSTRATION 1: Create a natural medium or close documentary scene that explains a practical use, process or customer interaction from the article. This is an in-content illustration, not a hero banner. Keep the supplied product reference recognizable but show a different camera angle and context.",
+            2 => "INLINE ILLUSTRATION 2: Create a wide or overhead documentary scene showing delivery, preparation, quality checking, workspace or real-world service related to the article. Use a clearly different composition from previous images and keep the supplied product reference consistent when present."
+        );
+        $prompt = $job['prompt'] . "\n\n" . $variant_prompts[$variant_index] . "\nDo not add text, invented logos or unrelated objects. Use natural neutral daylight and realistic true-to-life colors.";
+        $inline_job = $job;
+        $inline_job['prompt'] = $prompt;
+        $inline_job['title'] = $job['title'] . ' - Minh hoa ' . $variant_index;
+        // Bộ sinh ảnh hiện tại tự gán thumbnail khi nhận post_id; khôi phục ảnh đại diện sau khi tạo ảnh phụ.
+        $attach_id = $this->generate_featured_image($post_id, $inline_job);
+        if ($featured_id > 0) {
+            $this->ensure_featured_image($post_id, $featured_id);
+        }
+        if (!$attach_id && $featured_id > 0) {
+            $attach_id = $featured_id;
+        }
+        if ($attach_id > 0 && $this->insert_inline_image($post_id, $attach_id, $variant_index)) {
+            $inline_ids[] = $attach_id;
+            update_post_meta($post_id, '_agent_seo_inline_image_ids', array_values(array_unique($inline_ids)));
+        }
+        delete_transient('agent_seo_inline_image_lock_' . $post_id);
+        if (count($inline_ids) < 2) {
+            wp_schedule_single_event(time() + 20, 'agent_seo_inline_image_task', array($post_id));
+        } else {
+            delete_post_meta($post_id, '_agent_seo_inline_image_job');
+        }
+    }
+
+    private function insert_inline_image($post_id, $attach_id, $position) {
+        $post = get_post($post_id);
+        if (!$post || !$attach_id) {
+            return false;
+        }
+        $image_html = wp_get_attachment_image($attach_id, 'large', false, array(
+            'class' => 'agent-seo-inline-image',
+            'loading' => 'lazy',
+            'alt' => get_the_title($post_id) . ' - hình minh họa ' . intval($position)
+        ));
+        if (empty($image_html)) {
+            return false;
+        }
+        $content = $post->post_content;
+        $paragraphs = preg_split('/(<\/p>)/i', $content, -1, PREG_SPLIT_DELIM_CAPTURE);
+        $insert_after = $position === 1 ? 3 : 7;
+        $offset = 0;
+        $paragraph_count = 0;
+        for ($i = 0; $i < count($paragraphs); $i++) {
+            $offset += strlen($paragraphs[$i]);
+            if (stripos($paragraphs[$i], '</p>') !== false) {
+                $paragraph_count++;
+                if ($paragraph_count >= $insert_after) {
+                    break;
+                }
+            }
+        }
+        $content = substr($content, 0, $offset) . '\n<figure class="agent-seo-inline-figure" style="margin:32px auto; text-align:center; max-width:900px;">' . $image_html . '</figure>\n' . substr($content, $offset);
+        $updated = wp_update_post(array('ID' => $post_id, 'post_content' => $content), true);
+        return !is_wp_error($updated);
+    }
+
+    private function mark_batch_image_finished($post_id, $success) {
+        $batch = get_option('aseo_batch_status', array());
+        if (!is_array($batch) || empty($batch['pending_images']) || !is_array($batch['pending_images'])) {
+            return;
+        }
+        $post_id = intval($post_id);
+        $batch['pending_images'] = array_values(array_filter($batch['pending_images'], function($id) use ($post_id) {
+            return intval($id) !== $post_id;
+        }));
+        if (!$success) {
+            $errors = isset($batch['image_errors']) && is_array($batch['image_errors']) ? $batch['image_errors'] : array();
+            $errors[] = $post_id;
+            $batch['image_errors'] = array_values(array_unique($errors));
+        }
+        if (empty($batch['pending_images']) && intval(isset($batch['completed']) ? $batch['completed'] : 0) >= intval(isset($batch['total']) ? $batch['total'] : 0)) {
+            $batch['status'] = 'complete';
+            $failed_count = !empty($batch['image_errors']) ? count($batch['image_errors']) : 0;
+            $batch['message'] = $failed_count > 0
+                ? 'Đã tạo xong bài viết; có ' . $failed_count . ' ảnh đại diện chưa tạo được sau nhiều lần thử.'
+                : 'Đã tạo xong toàn bộ bài viết và ảnh đại diện.';
+            $batch['finished_at'] = time();
+        }
+        $batch['updated_at'] = time();
+        update_option('aseo_batch_status', $batch, false);
+    }
+
+    private function generate_featured_image($post_id, $job) {
+        $api_key = get_option('aseo_gemini_api_key', '');
+        $duky_key = get_option('aseo_duky_api_key', '');
+        $nvidia_key = get_option('aseo_nvidia_api_key', '');
+        $engine = get_option('aseo_image_engine', 'duky');
+        if ($engine === 'kaggle') {
+            $engine = 'duky';
+        }
+        $prompt = isset($job['prompt']) ? $job['prompt'] : '';
+        $title = isset($job['title']) ? $job['title'] : get_the_title($post_id);
+        $keyword = isset($job['keyword']) ? $job['keyword'] : '';
+        $product_image = isset($job['product_image']) ? $job['product_image'] : '';
+        $attach_id = false;
+        if ($engine === 'imagen' && !empty($api_key)) {
+            return Agent_SEO_Gemini_Image::generate_and_save_image($api_key, $prompt, $post_id, $title, $keyword);
+        }
+        if ($engine === 'nvidia' && !empty($nvidia_key)) {
+            return Agent_SEO_Gemini_Image::generate_and_save_image_nvidia($nvidia_key, $prompt, $post_id, $title, $keyword);
+        }
+        if (!empty($duky_key)) {
+            $attach_id = Agent_SEO_Gemini_Image::generate_and_save_image_duky($duky_key, $prompt, $post_id, $title, $keyword, $product_image);
+        }
+        if (!$attach_id && !empty($nvidia_key)) {
+            $attach_id = Agent_SEO_Gemini_Image::generate_and_save_image_nvidia($nvidia_key, $prompt, $post_id, $title, $keyword);
+        }
+        if (!$attach_id && !empty($api_key)) {
+            $attach_id = Agent_SEO_Gemini_Image::generate_and_save_image($api_key, $prompt, $post_id, $title, $keyword);
+        }
+        return $attach_id;
+    }
+
+    private function ensure_featured_image($post_id, $attach_id) {
+        $post_id = intval($post_id);
+        $attach_id = intval($attach_id);
+        if ($post_id <= 0 || $attach_id <= 0 || !wp_attachment_is_image($attach_id)) {
+            return false;
+        }
+        set_post_thumbnail($post_id, $attach_id);
+        if (intval(get_post_thumbnail_id($post_id)) !== $attach_id) {
+            update_post_meta($post_id, '_thumbnail_id', $attach_id);
+        }
+        return intval(get_post_thumbnail_id($post_id)) === $attach_id;
+    }
+
+    private function clear_image_job($post_id) {
+        delete_post_meta($post_id, '_agent_seo_image_job');
+        delete_post_meta($post_id, '_agent_seo_image_attempts');
+        delete_post_meta($post_id, '_agent_seo_duky_media_id');
+        $timestamp = wp_next_scheduled('agent_seo_image_retry_task', array($post_id));
+        if ($timestamp) {
+            wp_unschedule_event($timestamp, 'agent_seo_image_retry_task', array($post_id));
+        }
+    }
+
+    /**
+     * Thực thi một chu trình viết bài hoàn chỉnh cho một từ khóa tiếp theo
+     */
+    public function run_single_task($requested_status = '', $product_id_override = 0) {
+        $api_key       = get_option('aseo_gemini_api_key', '');
+        $niche         = get_option('aseo_niche', 'Sản phẩm, dịch vụ và lĩnh vực kinh doanh của website');
+        $brand_voice   = get_option('aseo_brand_voice', 'Chuyên nghiệp, tin cậy, rõ ràng và phù hợp với khách hàng mục tiêu');
+        $keywords_text = get_option('aseo_keywords', '');
+
+        // Lấy thông tin cấu hình thương hiệu tự chọn
+        $brand_data = array(
+            'brand_name'    => get_option('aseo_brand_name', ''),
+            'brand_address' => get_option('aseo_brand_address', ''),
+            'brand_phone'   => get_option('aseo_brand_phone', ''),
+            'brand_contact' => get_option('aseo_brand_contact', ''),
+            'brand_price'   => get_option('aseo_brand_price', ''),
+            'brand_cta'     => get_option('aseo_brand_cta', '')
+        );
+
+        $product_id = $product_id_override > 0 ? $product_id_override : get_option('aseo_target_product', '');
+        if (class_exists('WooCommerce') && !empty($product_id)) {
+            $product = wc_get_product($product_id);
+            if ($product) {
+                $raw_desc = wp_strip_all_tags($product->get_short_description() ? $product->get_short_description() : $product->get_description());
+                $clean_desc = str_replace(array('"', "'", "\r", "\n", "\\"), ' ', $raw_desc);
+                $clean_desc = mb_substr(trim($clean_desc), 0, 150);
+                if (mb_strlen($raw_desc) > 150) {
+                    $clean_desc .= '...';
+                }
+
+                $brand_data['product_name'] = str_replace(array('"', "'", "\\"), '', $product->get_name());
+                $brand_data['product_desc'] = $clean_desc;
+                $brand_data['product_price'] = str_replace(array('"', "'", "\\"), '', strip_tags(wc_price($product->get_price())));
+                $brand_data['product_url'] = esc_url(get_permalink($product_id));
+                
+                // Trích xuất ảnh nổi bật của sản phẩm nếu có
+                $image_id = $product->get_image_id();
+                $brand_data['product_image'] = $image_id ? esc_url(wp_get_attachment_url($image_id)) : '';
+                $brand_data['product_image_id'] = $image_id ? absint($image_id) : 0;
+
+                // Định nghĩa chuỗi thông tin để hướng dẫn AI viết bài tập trung
+                $brand_data['product_info'] = "SẢN PHẨM MỤC TIÊU CẦN SEO:\n" .
+                    "- Tên sản phẩm: " . $brand_data['product_name'] . "\n" .
+                    "- Mô tả: " . $brand_data['product_desc'] . "\n" .
+                    "- Giá bán: " . $brand_data['product_price'] . "\n" .
+                    "- Link mua hàng trực tiếp: " . $brand_data['product_url'] . "\n";
+            }
+        }
+
+        // Ảnh tham chiếu chọn từ Media Library được ưu tiên hơn ảnh sản phẩm mặc định khi tạo ảnh AI.
+        $reference_image_id = absint(get_option('aseo_reference_image_id', 0));
+        if ($reference_image_id > 0 && wp_attachment_is_image($reference_image_id)) {
+            $reference_image_url = wp_get_attachment_url($reference_image_id);
+            if (!empty($reference_image_url)) {
+                $brand_data['product_image_id'] = $reference_image_id;
+                $brand_data['product_image'] = esc_url($reference_image_url);
+            }
+        }
+
+        if (empty($api_key)) {
+            return array('success' => false, 'message' => 'Thiếu cấu hình Gemini API Key.');
+        }
+
+        // 1. Phân tích từ khóa tiếp theo chưa được viết
+        $lines = explode("\n", $keywords_text);
+        $target_keyword = '';
+        $target_index   = -1;
+
+        foreach ($lines as $index => $line) {
+            $trimmed = trim($line);
+            if (empty($trimmed)) {
+                continue;
+            }
+            
+            // Bỏ qua dòng đã có tiền tố đánh dấu viết xong
+            if (preg_match('/^\[(x|đã viết)\]/iu', $trimmed)) {
+                continue;
+            }
+
+            $target_keyword = $trimmed;
+            $target_index   = $index;
+            break;
+        }
+
+        $is_auto_generated = false;
+        if (empty($target_keyword)) {
+            // Hàng đợi trống hoặc đã viết xong, tự động suy nghĩ từ khóa mới liên quan đến sản phẩm
+            $prod_info_for_keyword = isset($brand_data['product_info']) ? $brand_data['product_info'] : ("Lĩnh vực/Chủ đề: " . $niche);
+            
+            // Tập hợp các từ khóa đã viết để tránh trùng lặp
+            $existing_keywords = array();
+            foreach ($lines as $line) {
+                $trimmed = trim($line);
+                if (!empty($trimmed)) {
+                    // Loại bỏ tiền tố [Đã viết] khi truyền cho AI đối chiếu
+                    $existing_keywords[] = preg_replace('/^\[(x|đã viết)\]\s+/iu', '', $trimmed);
+                }
+            }
+            
+            $brainstormed_keyword = Agent_SEO_Gemini_Text::generate_keyword_from_product($api_key, $prod_info_for_keyword, $existing_keywords);
+            if (empty($brainstormed_keyword)) {
+                return array('success' => false, 'message' => 'Danh sách từ khóa trống và AI không thể tự động suy nghĩ từ khóa mới.');
+            }
+            
+            $target_keyword = $brainstormed_keyword;
+            $is_auto_generated = true;
+        }
+
+        // Một primary keyword cố định cho toàn bộ cụm bài; keyword trong hàng đợi là chủ đề phụ từng bài.
+        $topic_keyword = $target_keyword;
+        $primary_keyword = trim(get_option('aseo_primary_keyword', ''));
+        if (empty($primary_keyword)) {
+            return array(
+                'success' => false,
+                'message' => 'Bạn chưa nhập từ khóa chính cố định. Vui lòng nhập từ khóa chính trong tab SEO & Từ khóa rồi lưu cấu hình trước khi tạo bài.'
+            );
+        }
+        $brand_data['article_topic'] = $topic_keyword;
+        $global_secondary_raw = trim(get_option('aseo_secondary_keywords', ''));
+        $global_secondary_items = preg_split('/[\r\n,;]+/', $global_secondary_raw);
+        $global_secondary_clean = array();
+        foreach ($global_secondary_items as $global_secondary_item) {
+            $global_secondary_item = sanitize_text_field(trim($global_secondary_item));
+            if ($global_secondary_item === '' || mb_strtolower($global_secondary_item) === mb_strtolower($primary_keyword)) {
+                continue;
+            }
+            $global_secondary_clean[mb_strtolower($global_secondary_item)] = $global_secondary_item;
+            if (count($global_secondary_clean) >= 3) {
+                break;
+            }
+        }
+        $brand_data['global_secondary_keywords'] = implode("\n", array_values($global_secondary_clean));
+
+        // 2. Gọi Gemini để viết nội dung bài viết
+        $article = Agent_SEO_Gemini_Text::generate_content($api_key, $primary_keyword, $niche, $brand_voice, $brand_data);
+        if (!$article['success']) {
+            return array('success' => false, 'message' => 'Lỗi tạo văn bản: ' . $article['message']);
+        }
+
+        // Tiêu đề do AI tạo đã được tối ưu hóa tự nhiên và lồng ghép từ khóa sáng tạo.
+        $article['content'] = $this->ensure_rank_math_toc($article['content']);
+
+        // Rank Math: meta description phải chứa nguyên văn primary keyword.
+        // AI đôi khi viết mô tả hay nhưng bỏ quên cụm từ này, nên chuẩn hóa lại trước khi lưu WordPress.
+        $article['meta_description'] = $this->ensure_primary_in_meta_description(
+            isset($article['meta_description']) ? $article['meta_description'] : '',
+            $primary_keyword
+        );
+
+        // Rank Math: Giữ từ khóa chính riêng biệt của bài viết làm từ khóa tập trung chính (để tránh trùng lặp)
+        // và thêm từ khóa chính chung của cụm bài làm từ khóa phụ.
+        $post_primary_keyword = !empty($article['primary_keyword']) ? sanitize_text_field($article['primary_keyword']) : $primary_keyword;
+        $rank_math_keywords_list = array($post_primary_keyword);
+        
+        $secondary_sources = array();
+        if (mb_strtolower($post_primary_keyword) !== mb_strtolower($primary_keyword)) {
+            $secondary_sources[] = $primary_keyword;
+        }
+        $secondary_sources[] = $brand_data['global_secondary_keywords'];
+        $secondary_sources[] = isset($article['secondary_keyword']) ? $article['secondary_keyword'] : '';
+        $max_secondary_keywords = 3;
+        foreach ($secondary_sources as $secondary_source) {
+            $secondary_items = preg_split('/[\r\n,;]+/', $secondary_source);
+            foreach ($secondary_items as $secondary_item) {
+                $secondary_item = sanitize_text_field(trim($secondary_item));
+                if (empty($secondary_item)) {
+                    continue;
+                }
+                $is_duplicate = false;
+                foreach ($rank_math_keywords_list as $existing_keyword) {
+                    if (mb_strtolower($existing_keyword) === mb_strtolower($secondary_item)) {
+                        $is_duplicate = true;
+                        break;
+                    }
+                }
+                if (!$is_duplicate) {
+                    $rank_math_keywords_list[] = $secondary_item;
+                    if (count($rank_math_keywords_list) >= ($max_secondary_keywords + 1)) {
+                        break 2;
+                    }
+                }
+            }
+        }
+        $rank_math_keywords = implode(', ', $rank_math_keywords_list);
+
+        // 3. Lưu bài theo trạng thái cấu hình; mặc định là bản nháp để người dùng duyệt trước
+        $post_status = in_array($requested_status, array('draft', 'publish'), true)
+            ? $requested_status
+            : get_option('aseo_post_status', 'publish');
+        if (!in_array($post_status, array('draft', 'publish'), true)) {
+            $post_status = 'publish';
+        }
+
+        // Slug phải chứa primary keyword exact-match để Rank Math không báo thiếu từ khóa trong URL.
+        // Ghép thêm topic để mỗi bài trong cụm vẫn có slug riêng.
+        $primary_slug = sanitize_title($primary_keyword);
+        $topic_slug = sanitize_title($topic_keyword);
+        $slug_seed = $primary_slug;
+        if ($topic_slug !== '' && $topic_slug !== $primary_slug) {
+            $slug_seed .= '-' . $topic_slug;
+        }
+        $article_slug = $this->limit_article_slug($slug_seed);
+        if ($article_slug === '') {
+            $article_slug = $this->limit_article_slug($topic_keyword);
+        }
+        if ($article_slug === '') {
+            $article_slug = $this->limit_article_slug($article['slug']);
+        }
+        if (get_page_by_path($article_slug, OBJECT, 'post')) {
+            $article_slug = $this->limit_article_slug($primary_slug . '-' . $topic_slug . '-' . sanitize_title($article['seo_title']));
+        }
+        if (get_page_by_path($article_slug, OBJECT, 'post')) {
+            // Trường hợp hiếm khi AI trả cả tiêu đề và chủ đề trùng hoàn toàn.
+            // Dùng mã nội dung ngắn thay cho hậu tố số vô nghĩa của WordPress.
+            $article_slug = $this->limit_article_slug($primary_slug . '-' . $topic_slug, 34)
+                . '-goc-' . substr(md5($topic_keyword . '|' . $article['seo_title'] . '|' . $article['content']), 0, 6);
+        }
+
+        $post_data = array(
+            'post_title'   => $article['seo_title'],
+            'post_name'    => $article_slug,
+            'post_content' => $article['content'],
+            'post_excerpt' => $article['meta_description'],
+            'post_status'  => $post_status,
+            'post_type'    => 'post',
+            'post_author'  => 1, // Gán cho Admin
+            'meta_input'   => array(
+                '_agent_seo_generated' => '1',
+                '_agent_seo_keyword'   => $target_keyword,
+                '_agent_seo_primary_keyword' => $primary_keyword,
+                '_agent_seo_global_secondary_keywords' => $brand_data['global_secondary_keywords'],
+                '_agent_seo_secondary_keywords' => $article['secondary_keyword'],
+                
+                // Rank Math SEO Integration (Lưu cả 2 loại có và không có gạch dưới để tương thích 100%)
+                'rank_math_title'          => $article['seo_title'],
+                'rank_math_description'    => $article['meta_description'],
+                'rank_math_focus_keyword'  => $rank_math_keywords,
+                '_rank_math_title'         => $article['seo_title'],
+                '_rank_math_description'   => $article['meta_description'],
+                '_rank_math_focus_keyword' => $rank_math_keywords,
+                
+                // Yoast SEO Integration
+                '_yoast_wpseo_title'    => $article['seo_title'],
+                '_yoast_wpseo_metadesc' => $article['meta_description'],
+                '_yoast_wpseo_focuskw'  => $primary_keyword
+            )
+        );
+
+        $post_id = wp_insert_post($post_data);
+        if (is_wp_error($post_id)) {
+            return array('success' => false, 'message' => 'Lỗi đăng bài viết vào WordPress: ' . $post_id->get_error_message());
+        }
+
+        // 4. Tạo ảnh thực tế và gán làm ảnh đại diện
+        // Sử dụng image_prompt do AI tạo ra tương ứng với chủ đề bài viết để đảm bảo tính liên quan cao nhất
+        $article_context = wp_strip_all_tags($article['content']);
+        $article_context = preg_replace('/\s+/', ' ', $article_context);
+        $article_context = mb_substr(trim($article_context), 0, 500);
+        $base_image_prompt = !empty($article['image_prompt'])
+            ? $article['image_prompt']
+            : 'A realistic editorial photograph that directly illustrates the article topic, with a natural Vietnamese setting and no generic product hero shot';
+        $master_prompt = trim(get_option('aseo_master_prompt', ''));
+        if (empty($master_prompt)) {
+            $master_prompt = trim(get_option('aseo_master_image_prompt', ''));
+        }
+        if (!empty($master_prompt)) {
+            $base_image_prompt = $master_prompt . "\n\nARTICLE-SPECIFIC IMAGE BRIEF:\n" . $base_image_prompt;
+        }
+        $scene_variants = array(
+            'CLOSE-UP DETAIL: tight close-up at eye level, 50mm macro-style framing of the product texture, label color and a human hand using it; shallow depth of field, background softly blurred',
+            'MEDIUM HUMAN ACTION: medium shot at eye level showing a real person inspecting, handling or advising about the product in its natural workplace',
+            'WIDE ESTABLISHING: wide 24mm documentary shot showing the complete store, workshop, warehouse or service environment with the product integrated naturally',
+            'LOW ANGLE PROCESS: subtle low-angle three-quarter view of a worker carrying, loading, installing or preparing the product; realistic depth and motion',
+            'HIGH ANGLE OVERHEAD: high-angle or overhead documentary view of an organized work surface, packing area, ingredients, tools or order preparation',
+            'DELIVERY AND LOGISTICS: side or rear three-quarter shot of authentic loading, delivery, handover or transport activity; vehicle and people support the story',
+            'QUALITY CONTROL: medium close-up of an expert checking, weighing, testing or inspecting the product with appropriate tools and natural concentration',
+            'CUSTOMER EXPERIENCE: over-the-shoulder shot from behind a customer receiving advice, comparing options or using the product in a real setting',
+            'PRODUCTION BEHIND THE SCENES: diagonal side view of preparation, manufacturing, workshop or team operation with layered foreground and background',
+            'ENVIRONMENTAL PORTRAIT: 35mm environmental portrait of a relevant worker or customer with the product visible as a natural part of the scene'
+        );
+        $scene_index = abs(crc32($topic_keyword . '|' . $article['seo_title'] . '|' . $post_id)) % count($scene_variants);
+        $selected_scene = $scene_variants[$scene_index];
+        $reference_instruction = !empty($brand_data['product_image'])
+            ? "PRODUCT REFERENCE PRIORITY: The supplied product reference image is the primary visual subject. Preserve its exact package shape, printed markings and dominant colors; show one clearly recognizable package in the foreground occupying about 35-50% of the frame. Any background packages must be blurred, secondary and visually consistent with the reference. Do not replace it with generic sacks or packaging of another color."
+            : "If no product reference is supplied, do not invent packaging; focus on people, process, place, tools or outcome appropriate to the article.";
+        $image_prompt = $base_image_prompt . "\n\nARTICLE CONTEXT (must guide the scene):\n"
+            . "Title: " . $article['seo_title'] . "\n"
+            . "Primary keyword: " . $primary_keyword . "\n"
+            . "Article subtopic: " . $topic_keyword . "\n"
+            . "Summary: " . $article_context . "\n\n"
+            . "SELECTED SHOT AND SCENE FOR VISUAL DIVERSITY: " . $selected_scene . ". Follow this camera distance and angle; do not revert to a generic warehouse medium shot. Adapt the scene naturally to the article topic and vary the composition across articles. "
+            . "Use an environmental documentary shot with authentic human activity. " . $reference_instruction . " "
+            . "Use cool-toned 6000K-6500K daylight, crisp cool color temperature, accurate white balance, clean whites and cool grays, realistic true-to-life colors, and soft non-yellow shadows. "
+            . "No warm golden light, yellow/orange cast, sunset, cinematic grading, dramatic advertising light, glossy 3D render, plastic CGI look, generic AI stock-photo composition, or random props. No readable text or newly invented logos.";
+        $image_prompt .= "\n\nFINAL LIGHTING OVERRIDE (must follow exactly): Photographed in real soft natural daylight, preferably open shade, cool overcast sky, or bright overcast window light. Cool white balance 6000K-6500K, crisp cool color temperature, clean neutral whites and cool grays, realistic skin tones, physically accurate shadows. ABSOLUTELY NO warm white balance, yellow tint, yellow cast, orange cast, golden-hour light, warm golden glow, tungsten light, amber filter, sepia, warm beige tones, cinematic teal-orange grade, glossy studio glow, CGI, or artificial AI lighting. The scene must look like an unedited documentary photograph taken with a real camera.";
+        
+        $product_image = isset($brand_data['product_image']) ? $brand_data['product_image'] : '';
+        $image_job = array(
+            'prompt' => $image_prompt,
+            'title' => $article['seo_title'],
+            'keyword' => $target_keyword,
+            'product_image' => $product_image,
+            'product_image_id' => isset($brand_data['product_image_id']) ? absint($brand_data['product_image_id']) : 0
+        );
+        update_post_meta($post_id, '_agent_seo_image_job', $image_job);
+        // Giữ một bản sao prompt riêng cho 2 ảnh minh họa nội dung sau này.
+        update_post_meta($post_id, '_agent_seo_inline_image_job', $image_job);
+        update_post_meta($post_id, '_agent_seo_inline_image_ids', array());
+        update_post_meta($post_id, '_agent_seo_image_attempts', 0);
+        if (!wp_next_scheduled('agent_seo_image_retry_task', array($post_id))) {
+            wp_schedule_single_event(time() + 15, 'agent_seo_image_retry_task', array($post_id));
+        }
+        $attach_id = $this->generate_featured_image($post_id, $image_job);
+        $ai_image_success = $this->ensure_featured_image($post_id, $attach_id);
+        $image_is_set = $ai_image_success;
+        // Fallback an toàn: nếu AI/CDN lỗi nhưng sản phẩm có ảnh gốc, dùng ảnh sản phẩm
+        // để bài không bị thiếu ảnh đại diện. Ảnh AI vẫn luôn được ưu tiên khi tạo thành công.
+        if (!$image_is_set && !empty($image_job['product_image_id'])) {
+            $image_is_set = $this->ensure_featured_image($post_id, $image_job['product_image_id']);
+        }
+        if ($ai_image_success) {
+            $this->clear_image_job($post_id);
+        }
+        if (!wp_next_scheduled('agent_seo_inline_image_task', array($post_id))) {
+            wp_schedule_single_event(time() + 30, 'agent_seo_inline_image_task', array($post_id));
+        }
+        $image_warning = '';
+        if (!$image_is_set) {
+            $image_warning = 'Ảnh chưa hoàn tất. Hệ thống sẽ tự thử lại bằng DukyAI trong một request riêng.';
+            error_log('Agent SEO Warning: Không thể tạo ảnh đại diện cho bài viết ID: ' . $post_id);
+        }
+
+        // 5. Tự động đi liên kết nội bộ (Internal Link)
+        Agent_SEO_Linker::add_internal_links($post_id);
+
+        // 6. Cập nhật lại danh sách từ khóa trong cấu hình (Đánh dấu từ khóa đã viết xong)
+        if ($is_auto_generated) {
+            // Loại bỏ các dòng trống cuối cùng nếu có trước khi thêm
+            $lines = array_filter($lines, 'trim');
+            $lines[] = '[Đã viết] ' . $target_keyword;
+        } else {
+            $lines[$target_index] = '[Đã viết] ' . $target_keyword;
+        }
+        $updated_keywords_text = implode("\n", $lines);
+        update_option('aseo_keywords', $updated_keywords_text);
+
+        return array(
+            'success'       => true,
+            'post_id'       => $post_id,
+            'title'         => $article['seo_title'],
+            'image_warning' => $image_warning
+        );
+    }
+
+    private function ensure_primary_in_meta_description($description, $primary_keyword) {
+        $description = sanitize_text_field((string) $description);
+        $primary_keyword = sanitize_text_field((string) $primary_keyword);
+        if ($primary_keyword === '') {
+            return mb_substr($description, 0, 160);
+        }
+        if ($description === '') {
+            $description = 'Khám phá thông tin chi tiết về ' . $primary_keyword . ' và cách lựa chọn phù hợp.';
+        } elseif (mb_stripos($description, $primary_keyword) === false) {
+            $description = $primary_keyword . ': ' . $description;
+        }
+        if (mb_strlen($description) > 160) {
+            $description = rtrim(mb_substr($description, 0, 157), " \t\n\r\0\x0B,.;:-") . '...';
+        }
+        return $description;
+    }
+
+    private function limit_article_slug($text, $max_length = 45) {
+        $slug = sanitize_title($text);
+        if (strlen($slug) <= $max_length) {
+            return $slug;
+        }
+        $short = rtrim(substr($slug, 0, $max_length), '-');
+        $word_boundary = preg_replace('/-[^-]*$/', '', $short);
+        return strlen($word_boundary) >= 30 ? $word_boundary : $short;
+    }
+
+    private function ensure_rank_math_toc($content) {
+        if (stripos($content, 'wp:rank-math/toc-block') !== false) {
+            return $content;
+        }
+        $toc_items = array();
+        $used_ids = array();
+        $content = preg_replace_callback('/<h2\b([^>]*)>(.*?)<\/h2>/isu', function($matches) use (&$toc_items, &$used_ids) {
+            $attributes = $matches[1];
+            $heading_html = $matches[2];
+            $heading_text = trim(wp_strip_all_tags(html_entity_decode($heading_html, ENT_QUOTES | ENT_HTML5, 'UTF-8')));
+            if ($heading_text === '') {
+                return $matches[0];
+            }
+            $heading_id = '';
+            if (preg_match('/\bid=["\']([^"\']+)["\']/iu', $attributes, $id_match)) {
+                $heading_id = sanitize_title($id_match[1]);
+            }
+            if ($heading_id === '') {
+                $heading_id = sanitize_title($heading_text);
+            }
+            $base_id = $heading_id;
+            $suffix = 2;
+            while (isset($used_ids[$heading_id])) {
+                $heading_id = $base_id . '-' . $suffix;
+                $suffix++;
+            }
+            $used_ids[$heading_id] = true;
+            $toc_items[] = array('id' => $heading_id, 'title' => $heading_text);
+            $attributes = preg_replace('/\s*\bid=["\'][^"\']*["\']/iu', '', $attributes);
+            return '<h2' . $attributes . ' id="' . esc_attr($heading_id) . '">' . $heading_html . '</h2>';
+        }, $content);
+        if (count($toc_items) < 2) {
+            return $content;
+        }
+        $toc_list = '';
+        foreach ($toc_items as $toc_item) {
+            $toc_list .= '<li><a href="#' . esc_attr($toc_item['id']) . '">' . esc_html($toc_item['title']) . '</a></li>';
+        }
+        $toc = '<!-- wp:rank-math/toc-block {"title":"Mục lục bài viết"} -->'
+            . '<div class="wp-block-rank-math-toc-block agent-seo-toc"><p><strong>Mục lục bài viết</strong></p><nav><ul>'
+            . $toc_list
+            . '</ul></nav></div><!-- /wp:rank-math/toc-block -->';
+        $first_paragraph_end = stripos($content, '</p>');
+        if ($first_paragraph_end !== false) {
+            $insert_at = $first_paragraph_end + 4;
+            return substr($content, 0, $insert_at) . $toc . substr($content, $insert_at);
+        }
+        return $toc . $content;
+    }
+
+    /**
+     * Tự động điều chỉnh lịch chạy WP-Cron khi người dùng đổi cài đặt tần suất
+     */
+    public function reschedule_cron_on_update($old_value, $new_value) {
+        if ($old_value === $new_value) {
+            return;
+        }
+
+        $timestamp = wp_next_scheduled('agent_seo_cron_hook');
+        if ($timestamp) {
+            wp_unschedule_event($timestamp, 'agent_seo_cron_hook');
+        }
+
+        // Đăng ký lịch mới dựa trên cài đặt của người dùng
+        $allowed_intervals = array('hourly', 'twicedaily', 'daily', 'weekly');
+        $interval = in_array($new_value, $allowed_intervals) ? $new_value : 'daily';
+
+        wp_schedule_event(time(), $interval, 'agent_seo_cron_hook');
+    }
+}
