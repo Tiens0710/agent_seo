@@ -82,6 +82,9 @@ class Agent_SEO_Settings {
 
         $job = get_post_meta($post_id, '_agent_seo_image_job', true);
         if (!is_array($job) || empty($job['prompt'])) {
+            $job = get_post_meta($post_id, '_agent_seo_inline_image_job', true);
+        }
+        if (!is_array($job) || empty($job['prompt'])) {
             // Tự động dựng lại job ảnh từ tiêu đề bài viết và sản phẩm mục tiêu
             $product_id = get_option('aseo_target_product', '');
             $product_image_url = '';
@@ -107,27 +110,43 @@ class Agent_SEO_Settings {
         }
 
         // Xóa các vết lịch sử cũ để thử lại sạch sẽ
+        update_post_meta($post_id, '_agent_seo_image_job', $job);
+        // Các bài cũ có thể chưa có job ảnh minh họa; dùng cùng ngữ cảnh để
+        // worker bổ sung tối đa 2 ảnh vào thân bài sau khi ảnh đại diện xong.
+        $inline_job = get_post_meta($post_id, '_agent_seo_inline_image_job', true);
+        if (!is_array($inline_job) || empty($inline_job['prompt'])) {
+            update_post_meta($post_id, '_agent_seo_inline_image_job', $job);
+        }
+        $inline_ids = get_post_meta($post_id, '_agent_seo_inline_image_ids', true);
+        if (!is_array($inline_ids)) {
+            update_post_meta($post_id, '_agent_seo_inline_image_ids', array());
+        }
+        update_post_meta($post_id, '_agent_seo_force_image_retry', '1');
         delete_post_meta($post_id, '_agent_seo_duky_media_id');
         delete_post_meta($post_id, '_agent_seo_image_attempts');
 
-        if (!class_exists('Agent_SEO_Orchestrator')) {
-            require_once dirname(__FILE__) . '/class-orchestrator.php';
+        // Ảnh có thể mất vài phút; không giữ AJAX request mở chờ API.
+        if (!wp_next_scheduled('agent_seo_image_retry_task', array($post_id))) {
+            wp_schedule_single_event(time(), 'agent_seo_image_retry_task', array($post_id));
         }
-
-        $orchestrator = new Agent_SEO_Orchestrator();
-        $attach_id = $orchestrator->generate_featured_image($post_id, $job);
-        $image_is_set = $orchestrator->ensure_featured_image($post_id, $attach_id);
-
-        if ($image_is_set) {
-            $orchestrator->clear_image_job($post_id);
-            $thumb_url = get_the_post_thumbnail_url($post_id, 'thumbnail');
-            wp_send_json_success(array(
-                'message' => 'Đã tạo lại ảnh AI thành công!',
-                'thumb_url' => $thumb_url
+        if (function_exists('spawn_cron')) {
+            spawn_cron(time());
+        }
+        // Một số VPS tắt DISABLE_WP_CRON nhưng vẫn cho phép gọi loopback;
+        // kích hoạt wp-cron không chặn request để worker thực sự được chạy.
+        if (defined('DISABLE_WP_CRON') && DISABLE_WP_CRON) {
+            wp_remote_post(site_url('/wp-cron.php'), array(
+                'timeout'   => 0.01,
+                'blocking'  => false,
+                'sslverify' => false
             ));
-        } else {
-            wp_send_json_error(array('message' => 'Tạo ảnh AI thất bại. Vui lòng kiểm tra API Key hoặc thử lại.'), 500);
         }
+        if (!wp_next_scheduled('agent_seo_inline_image_task', array($post_id))) {
+            // Chờ ảnh đại diện được tạo trước rồi mới chèn ảnh minh họa.
+            wp_schedule_single_event(time() + 90, 'agent_seo_inline_image_task', array($post_id));
+        }
+        wp_send_json_success(array('message' => 'Đã xếp hàng tạo lại ảnh. Hệ thống sẽ cập nhật sau khi hoàn tất.', 'queued' => true));
+
     }
 
     public function ajax_batch_status() {
@@ -163,10 +182,39 @@ class Agent_SEO_Settings {
                 }
             }
         }
+        if (isset($batch['status']) && $batch['status'] === 'images_pending' && !empty($batch['pending_inline_images']) && is_array($batch['pending_inline_images'])) {
+            $last_inline_kick = intval(isset($batch['last_inline_kick_at']) ? $batch['last_inline_kick_at'] : 0);
+            if (time() - $last_inline_kick >= 15) {
+                foreach ($batch['pending_inline_images'] as $pending_post_id) {
+                    $pending_post_id = absint($pending_post_id);
+                    if ($pending_post_id > 0 && !wp_next_scheduled('agent_seo_inline_image_task', array($pending_post_id))) {
+                        wp_schedule_single_event(time(), 'agent_seo_inline_image_task', array($pending_post_id));
+                    }
+                }
+                $batch['last_inline_kick_at'] = time();
+                update_option('aseo_batch_status', $batch, false);
+                if (function_exists('spawn_cron')) {
+                    spawn_cron(time());
+                }
+            }
+        }
         $total = max(0, intval(isset($batch['total']) ? $batch['total'] : 0));
         $completed = max(0, min($total, intval(isset($batch['completed']) ? $batch['completed'] : 0)));
+        $started_at = intval(isset($batch['started_at']) ? $batch['started_at'] : 0);
+        $finished_at = intval(isset($batch['finished_at']) ? $batch['finished_at'] : 0);
+        $updated_at = intval(isset($batch['updated_at']) ? $batch['updated_at'] : time());
+        $elapsed = 0;
+        if ($finished_at > 0 && $started_at > 0) {
+            $elapsed = max(0, $finished_at - $started_at);
+        } elseif ($started_at > 0) {
+            $elapsed = max(0, time() - $started_at);
+        }
         $batch['total'] = $total;
         $batch['completed'] = $completed;
+        $batch['started_at'] = $started_at;
+        $batch['finished_at'] = $finished_at;
+        $batch['updated_at'] = $updated_at;
+        $batch['elapsed'] = $elapsed;
         $batch['percent'] = $total > 0 ? intval(round(($completed / $total) * 100)) : 0;
         if (isset($batch['status']) && $batch['status'] === 'images_pending') {
             $batch['percent'] = 95;
@@ -444,6 +492,11 @@ class Agent_SEO_Settings {
      * Giao diện trang cài đặt quản trị
      */
     public function render_settings_page() {
+        // Xóa toàn bộ thông báo ngoài lề từ plugin khác (Elementor, RankMath...) hoặc WP Core trên trang Agent SEO
+        remove_all_actions('admin_notices');
+        remove_all_actions('all_admin_notices');
+        remove_all_actions('user_admin_notices');
+
         // Lấy các giá trị đã cấu hình
         $api_key = get_option('aseo_gemini_api_key', '');
         $nvidia_api_key = get_option('aseo_nvidia_api_key', '');
@@ -575,8 +628,8 @@ class Agent_SEO_Settings {
                 border: 2px solid rgba(197,168,92,0.4); border-radius: 12px;
                 display: flex; align-items: center; justify-content: center; font-size: 22px;
             }
-            .aseo-header h2 { margin: 0; color: #fff; font-size: 1.55rem; font-weight: 700; letter-spacing: -0.3px; }
-            .aseo-header h2 small { display: block; font-size: 0.78rem; font-weight: 400; color: rgba(255,255,255,0.6); margin-top: 2px; }
+            .aseo-header h2, .aseo-header .aseo-header-title { margin: 0; color: #fff; font-size: 1.55rem; font-weight: 700; letter-spacing: -0.3px; }
+            .aseo-header h2 small, .aseo-header .aseo-header-title small { display: block; font-size: 0.78rem; font-weight: 400; color: rgba(255,255,255,0.6); margin-top: 2px; }
             .aseo-header-right { display: flex; align-items: center; gap: 12px; z-index: 1; }
             .aseo-badge { background: linear-gradient(135deg, #C5A85C, #e0c97a); color: #0a1f14; font-size: 0.7rem; font-weight: 800; padding: 5px 14px; border-radius: 30px; text-transform: uppercase; letter-spacing: 0.5px; }
             .aseo-status-dot { display: flex; align-items: center; gap: 6px; font-size: 0.78rem; color: rgba(255,255,255,0.7); }
@@ -878,6 +931,24 @@ class Agent_SEO_Settings {
 
             /* ========== NOTICES ========== */
             .aseo-wrap .notice, .aseo-wrap .updated, .aseo-wrap .error { border-radius: 10px; margin: 0 0 16px; }
+            /* Ẩn tất cả thông báo ngoài lề từ plugin khác hoặc WP Core trên trang Agent SEO */
+            .toplevel_page_agent-seo-settings .notice:not(.aseo-own-notice),
+            .toplevel_page_agent-seo-settings .updated:not(.aseo-own-notice),
+            .toplevel_page_agent-seo-settings .error:not(.aseo-own-notice),
+            .toplevel_page_agent-seo-settings .update-nag,
+            .toplevel_page_agent-seo-settings .e-notice,
+            .toplevel_page_agent-seo-settings div[class*="notice"]:not(.aseo-own-notice),
+            .toplevel_page_agent-seo-settings div[class*="error"]:not(.aseo-own-notice),
+            .aseo-wrap .notice:not(.aseo-own-notice),
+            .aseo-wrap .updated:not(.aseo-own-notice),
+            .aseo-wrap .error:not(.aseo-own-notice),
+            .aseo-header .notice,
+            .aseo-header .updated,
+            .aseo-header .error,
+            .aseo-header .e-notice,
+            .aseo-header div[class*="notice"] {
+                display: none !important;
+            }
             .aseo-progress-card { display:none; margin:0 0 22px; padding:18px 20px; border:1px solid #cfe3d6; border-radius:14px; background:#f7fcf8; }
             .aseo-progress-card.visible { display:block; }
             .aseo-progress-head { display:flex; align-items:center; justify-content:space-between; gap:14px; margin-bottom:10px; }
@@ -887,6 +958,10 @@ class Agent_SEO_Settings {
             .aseo-progress-card.complete .aseo-spinner:after { content:'✓'; display:block; color:#16a34a; font-size:20px; line-height:20px; }
             .aseo-progress-card.failed { background:#fff7f7; border-color:#fecaca; }
             .aseo-progress-card.failed .aseo-spinner { animation:none; border-color:#dc2626; }
+            .aseo-progress-meta { display:flex; align-items:center; gap:10px; }
+            .aseo-progress-timer { display:inline-flex; align-items:center; gap:5px; font-weight:700; font-size:0.8rem; color:#334155; background:#e2eef0; border:1px solid #cbd5e1; padding:3px 10px; border-radius:8px; white-space:nowrap; }
+            .aseo-progress-card.complete .aseo-progress-timer { background:#dcfce7; border-color:#86efac; color:#166534; }
+            .aseo-progress-card.failed .aseo-progress-timer { background:#fee2e2; border-color:#fca5a5; color:#991b1b; }
             .aseo-progress-count { font-weight:800; color:#1a5c3a; white-space:nowrap; }
             .aseo-progress-track { height:10px; overflow:hidden; border-radius:999px; background:#e5eee8; }
             .aseo-progress-fill { width:0; height:100%; border-radius:inherit; background:linear-gradient(90deg,#16834b,#49b675); transition:width .45s ease; }
@@ -938,6 +1013,8 @@ class Agent_SEO_Settings {
             .aseo-posts-table .post-date { color: #94a3b8; font-size: 0.82rem; }
             .aseo-posts-table .post-link { color: #1a5c3a; font-weight: 600; font-size: 0.82rem; text-decoration: none; }
             .aseo-posts-table .post-link:hover { text-decoration: underline; }
+            .aseo-retry-image.is-queued { color:#166534 !important; border-color:#9bc7aa !important; background:#f0f9f2 !important; cursor:wait; }
+            .aseo-retry-image.is-queued::before { content:''; display:inline-block; width:12px; height:12px; margin-right:6px; vertical-align:-2px; border:2px solid #b9d8c1; border-top-color:#16834b; border-radius:50%; animation:aseoSpin .8s linear infinite; }
             .aseo-posts-table .post-link .dashicons { font-size: 13px; width: 13px; height: 13px; vertical-align: text-bottom; }
             .aseo-posts-empty { text-align: center; padding: 40px 20px; color: #94a3b8; font-size: 0.88rem; }
             .aseo-posts-empty .dashicons { font-size: 36px; width: 36px; height: 36px; display: block; margin: 0 auto 12px; color: #d1d5db; }
@@ -978,7 +1055,7 @@ class Agent_SEO_Settings {
             <div class="aseo-header">
                 <div class="aseo-header-left">
                     <div class="aseo-header-logo">🚀</div>
-                    <h2>Agent SEO<small>Hệ thống viết bài & sinh ảnh AI tự động</small></h2>
+                    <div class="aseo-header-title">Agent SEO<small>Hệ thống viết bài & sinh ảnh AI tự động</small></div>
                 </div>
                 <div class="aseo-header-right">
                     <span class="aseo-status-dot">Đang hoạt động</span>
@@ -1026,12 +1103,21 @@ class Agent_SEO_Settings {
                     </div>
                 </div>
 
-                <?php settings_errors('agent_seo_messages'); ?>
-                <?php if (!empty($_GET['aseo_gsc_success'])) : ?>
-                    <div class="notice notice-success"><p><?php echo esc_html(rawurldecode(wp_unslash($_GET['aseo_gsc_success']))); ?></p></div>
-                <?php elseif (!empty($_GET['aseo_gsc_error'])) : ?>
-                    <div class="notice notice-error"><p><?php echo esc_html(rawurldecode(wp_unslash($_GET['aseo_gsc_error']))); ?></p></div>
-                <?php endif; ?>
+                <div class="aseo-own-notices-box">
+                    <?php
+                    ob_start();
+                    settings_errors('agent_seo_messages');
+                    $se_output = ob_get_clean();
+                    if (!empty($se_output)) {
+                        echo str_replace('class="notice', 'class="notice aseo-own-notice', $se_output);
+                    }
+                    ?>
+                    <?php if (!empty($_GET['aseo_gsc_success'])) : ?>
+                        <div class="notice notice-success aseo-own-notice"><p><?php echo esc_html(rawurldecode(wp_unslash($_GET['aseo_gsc_success']))); ?></p></div>
+                    <?php elseif (!empty($_GET['aseo_gsc_error'])) : ?>
+                        <div class="notice notice-error aseo-own-notice"><p><?php echo esc_html(rawurldecode(wp_unslash($_GET['aseo_gsc_error']))); ?></p></div>
+                    <?php endif; ?>
+                </div>
 
                 <?php
                 $batch_total = intval(isset($batch_status['total']) ? $batch_status['total'] : 0);
@@ -1040,11 +1126,26 @@ class Agent_SEO_Settings {
                 $batch_percent = $batch_total > 0 ? intval(round(($batch_completed / $batch_total) * 100)) : 0;
                 if ($batch_state === 'images_pending') $batch_percent = 95;
                 $batch_visible = in_array($batch_state, array('queued', 'running', 'waiting', 'images_pending', 'complete', 'failed'), true);
+                
+                $batch_started_at = intval(isset($batch_status['started_at']) ? $batch_status['started_at'] : 0);
+                $batch_finished_at = intval(isset($batch_status['finished_at']) ? $batch_status['finished_at'] : 0);
+                $initial_elapsed = 0;
+                if ($batch_started_at > 0) {
+                    if (in_array($batch_state, array('complete', 'failed'), true) && $batch_finished_at > 0) {
+                        $initial_elapsed = max(0, $batch_finished_at - $batch_started_at);
+                    } else {
+                        $initial_elapsed = max(0, time() - $batch_started_at);
+                    }
+                }
+                $initial_timer_str = $batch_started_at > 0 ? sprintf('%02d:%02d', floor($initial_elapsed / 60), $initial_elapsed % 60) : '--:--';
                 ?>
-                <div id="aseo-progress-card" class="aseo-progress-card <?php echo $batch_visible ? 'visible ' . esc_attr($batch_state) : ''; ?>">
+                <div id="aseo-progress-card" class="aseo-progress-card <?php echo $batch_visible ? 'visible ' . esc_attr($batch_state) : ''; ?>" data-started="<?php echo esc_attr($batch_started_at); ?>" data-finished="<?php echo esc_attr($batch_finished_at); ?>">
                     <div class="aseo-progress-head">
                         <div class="aseo-progress-title"><span class="aseo-spinner"></span><span id="aseo-progress-label"><?php echo $batch_state === 'complete' ? 'Hoàn tất tạo bài' : 'AI đang xử lý bài viết'; ?></span></div>
-                        <div id="aseo-progress-count" class="aseo-progress-count"><?php echo esc_html($batch_completed . '/' . $batch_total . ' bài'); ?></div>
+                        <div class="aseo-progress-meta">
+                            <span id="aseo-progress-timer" class="aseo-progress-timer" title="Thời gian thực hiện">⏱️ <?php echo esc_html($initial_timer_str); ?></span>
+                            <div id="aseo-progress-count" class="aseo-progress-count"><?php echo esc_html($batch_completed . '/' . $batch_total . ' bài'); ?></div>
+                        </div>
                     </div>
                     <div class="aseo-progress-track"><div id="aseo-progress-fill" class="aseo-progress-fill" style="width:<?php echo esc_attr($batch_percent); ?>%;"></div></div>
                     <p id="aseo-progress-message" class="aseo-progress-message"><?php echo esc_html(isset($batch_status['message']) ? $batch_status['message'] : ''); ?></p>
@@ -1568,6 +1669,7 @@ class Agent_SEO_Settings {
                     var postId = button.getAttribute('data-post-id');
                     if (!postId) return;
                     button.disabled = true;
+                    button.classList.add('is-queued');
                     button.textContent = '🎨 Đang vẽ ảnh AI...';
                     var body = new URLSearchParams();
                     body.append('action', 'agent_seo_retry_image');
@@ -1577,6 +1679,12 @@ class Agent_SEO_Settings {
                         .then(function(response) { return response.json(); })
                         .then(function(payload) {
                             if (payload.success) {
+                                if (payload.data && payload.data.queued) {
+                                    button.textContent = 'Đang tạo ảnh…';
+                                    button.classList.add('is-queued');
+                                    window.setTimeout(function() { window.location.reload(); }, 30000);
+                                    return;
+                                }
                                 button.textContent = '✓ Đã tạo xong';
                                 button.style.color = '#166534';
                                 button.style.borderColor = '#166534';
@@ -1678,7 +1786,42 @@ class Agent_SEO_Settings {
             var progressCount = document.getElementById('aseo-progress-count');
             var progressMessage = document.getElementById('aseo-progress-message');
             var progressLabel = document.getElementById('aseo-progress-label');
+            var progressTimerEl = document.getElementById('aseo-progress-timer');
             var progressTimer = null;
+            var liveTimerInterval = null;
+            var currentBatchStartedAt = 0;
+            var currentBatchFinishedAt = 0;
+            var currentBatchStatus = '';
+
+            function formatTimer(totalSeconds) {
+                if (isNaN(totalSeconds) || totalSeconds < 0) totalSeconds = 0;
+                var mins = Math.floor(totalSeconds / 60);
+                var secs = totalSeconds % 60;
+                var hours = Math.floor(mins / 60);
+                mins = mins % 60;
+                var pad = function(n) { return (n < 10 ? '0' : '') + n; };
+                if (hours > 0) {
+                    return pad(hours) + ':' + pad(mins) + ':' + pad(secs);
+                }
+                return pad(mins) + ':' + pad(secs);
+            }
+
+            function updateTimerDisplay() {
+                if (!progressTimerEl) return;
+                if (!currentBatchStartedAt) {
+                    progressTimerEl.textContent = '⏱️ --:--';
+                    return;
+                }
+                var nowSecs = Math.floor(Date.now() / 1000);
+                var elapsed = 0;
+                if (currentBatchStatus === 'complete' || currentBatchStatus === 'failed') {
+                    var endSecs = currentBatchFinishedAt > 0 ? currentBatchFinishedAt : nowSecs;
+                    elapsed = Math.max(0, endSecs - currentBatchStartedAt);
+                } else {
+                    elapsed = Math.max(0, nowSecs - currentBatchStartedAt);
+                }
+                progressTimerEl.textContent = '⏱️ ' + formatTimer(elapsed);
+            }
 
             function renderBatchProgress(batch) {
                 if (!progressCard || !batch || batch.status === 'idle') return;
@@ -1686,12 +1829,24 @@ class Agent_SEO_Settings {
                 progressFill.style.width = (batch.percent || 0) + '%';
                 progressCount.textContent = (batch.completed || 0) + '/' + (batch.total || 0) + ' bài';
                 progressMessage.textContent = batch.message || '';
+                
+                currentBatchStartedAt = parseInt(batch.started_at, 10) || 0;
+                currentBatchFinishedAt = parseInt(batch.finished_at, 10) || 0;
+                currentBatchStatus = batch.status || '';
+                updateTimerDisplay();
+
+                if (batch.status === 'complete' || batch.status === 'failed') {
+                    if (liveTimerInterval) { window.clearInterval(liveTimerInterval); liveTimerInterval = null; }
+                } else if (!liveTimerInterval && currentBatchStartedAt > 0) {
+                    liveTimerInterval = window.setInterval(updateTimerDisplay, 1000);
+                }
+
                 if (batch.status === 'complete') {
                     progressLabel.textContent = 'Hoàn tất tạo bài';
                 } else if (batch.status === 'failed') {
                     progressLabel.textContent = 'Tạo bài gặp lỗi';
                 } else if (batch.status === 'images_pending') {
-                    progressLabel.textContent = 'Đang hoàn thiện ảnh đại diện';
+                    progressLabel.textContent = 'Đang hoàn thiện ảnh và bố cục bài';
                 } else {
                     progressLabel.textContent = 'AI đang xử lý bài viết';
                 }
@@ -1715,9 +1870,22 @@ class Agent_SEO_Settings {
                 }).catch(function() {});
             }
 
-            if (progressCard && (progressCard.classList.contains('queued') || progressCard.classList.contains('running') || progressCard.classList.contains('waiting') || progressCard.classList.contains('images_pending'))) {
-                pollBatchProgress();
-                progressTimer = window.setInterval(pollBatchProgress, 5000);
+            if (progressCard) {
+                currentBatchStartedAt = parseInt(progressCard.getAttribute('data-started'), 10) || 0;
+                currentBatchFinishedAt = parseInt(progressCard.getAttribute('data-finished'), 10) || 0;
+                if (progressCard.classList.contains('complete') || progressCard.classList.contains('failed')) {
+                    currentBatchStatus = progressCard.classList.contains('complete') ? 'complete' : 'failed';
+                } else if (progressCard.classList.contains('visible')) {
+                    currentBatchStatus = 'running';
+                }
+                updateTimerDisplay();
+                if (progressCard.classList.contains('queued') || progressCard.classList.contains('running') || progressCard.classList.contains('waiting') || progressCard.classList.contains('images_pending')) {
+                    if (!liveTimerInterval && currentBatchStartedAt > 0) {
+                        liveTimerInterval = window.setInterval(updateTimerDisplay, 1000);
+                    }
+                    pollBatchProgress();
+                    progressTimer = window.setInterval(pollBatchProgress, 5000);
+                }
             }
 
             // Tab switching

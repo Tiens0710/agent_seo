@@ -119,6 +119,7 @@ class Agent_SEO_Orchestrator {
                 $batch['status'] = 'failed';
                 $batch['message'] = 'Tác vụ bị lỗi: ' . $result['message'];
                 $batch['updated_at'] = time();
+                $batch['finished_at'] = time();
                 update_option('aseo_batch_status', $batch, false);
             }
             delete_transient('agent_seo_generation_lock');
