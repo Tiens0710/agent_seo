@@ -79,8 +79,8 @@ class Agent_SEO_Orchestrator {
      * Worker chạy một bài trong request WP-Cron riêng, tránh làm timeout trang quản trị.
      */
     public function run_background_task($requested_status = 'draft', $remaining = 1) {
-        @set_time_limit(360);
-        @ini_set('max_execution_time', '360');
+        @set_time_limit(720);
+        @ini_set('max_execution_time', '720');
         // Prevent duplicate WP-Cron requests from generating the same batch.
         if (get_transient('agent_seo_generation_lock')) {
             $remaining = max(1, intval($remaining));
@@ -99,7 +99,7 @@ class Agent_SEO_Orchestrator {
             }
             return;
         }
-        set_transient('agent_seo_generation_lock', time(), 900);
+        set_transient('agent_seo_generation_lock', time(), 1800);
         $remaining = max(1, intval($remaining));
         $batch = get_option('aseo_batch_status', array());
         if (is_array($batch) && isset($batch['total'])) {
@@ -718,9 +718,20 @@ class Agent_SEO_Orchestrator {
         if ($ai_image_success) {
             $this->clear_image_job($post_id);
         }
-        if (!wp_next_scheduled('agent_seo_inline_image_task', array($post_id))) {
-            wp_schedule_single_event(time() + 30, 'agent_seo_inline_image_task', array($post_id));
+
+        // Tạo 2 ảnh minh họa ngay trong luồng chính để đảm bảo bài hoàn tất 100%
+        // trước khi sang bài tiếp theo (không schedule WP-Cron riêng).
+        if ($image_is_set) {
+            for ($inline_round = 0; $inline_round < 2; $inline_round++) {
+                $this->run_inline_image_task($post_id);
+            }
+        } else {
+            // Ảnh đại diện lỗi → schedule ảnh phụ sau khi retry xong.
+            if (!wp_next_scheduled('agent_seo_inline_image_task', array($post_id))) {
+                wp_schedule_single_event(time() + 30, 'agent_seo_inline_image_task', array($post_id));
+            }
         }
+
         $image_warning = '';
         if (!$image_is_set) {
             $image_warning = 'Ảnh chưa hoàn tất. Hệ thống sẽ tự thử lại bằng DukyAI trong một request riêng.';
