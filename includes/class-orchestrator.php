@@ -139,7 +139,15 @@ class Agent_SEO_Orchestrator {
                 $pending_images[] = intval($result['post_id']);
                 $batch['pending_images'] = array_values(array_unique($pending_images));
             }
-            if ($remaining > 0) {
+            // Lưu remaining và requested_status vào batch để mark_batch_image_finished
+            // có thể schedule bài tiếp theo khi ảnh hoàn tất.
+            $batch['remaining'] = $remaining;
+            $batch['requested_status'] = $requested_status;
+            if (!empty($result['image_warning']) && $remaining > 0) {
+                // Ảnh chưa xong → chờ image retry hoàn tất rồi mới sang bài tiếp.
+                $batch['status'] = 'images_pending';
+                $batch['message'] = 'Bài ' . intval($batch['completed']) . '/' . intval($batch['total']) . ' đã viết xong. Đang chờ tạo ảnh đại diện trước khi sang bài tiếp...';
+            } elseif ($remaining > 0) {
                 $batch['status'] = 'waiting';
                 $batch['message'] = 'Đã hoàn tất bài ' . intval($batch['completed']) . '/' . intval($batch['total']) . '. Đang chuẩn bị bài tiếp theo...';
             } else {
@@ -155,8 +163,9 @@ class Agent_SEO_Orchestrator {
             }
             update_option('aseo_batch_status', $batch, false);
         }
-        if ($remaining > 0) {
-            // Chờ rất ngắn sau khi WordPress đã lưu xong bài/ảnh rồi mới bắt đầu bài tiếp theo.
+        // Chỉ schedule bài tiếp khi ảnh đã hoàn tất (không có image_warning).
+        // Nếu ảnh lỗi, mark_batch_image_finished sẽ schedule bài tiếp khi retry xong.
+        if ($remaining > 0 && empty($result['image_warning'])) {
             wp_schedule_single_event(time() + 5, 'agent_seo_background_task', array($requested_status, $remaining));
         }
         delete_transient('agent_seo_generation_lock');
@@ -186,7 +195,7 @@ class Agent_SEO_Orchestrator {
         set_transient('agent_seo_image_lock_' . $post_id, 1, 300);
         $attempts = intval(get_post_meta($post_id, '_agent_seo_image_attempts', true)) + 1;
         update_post_meta($post_id, '_agent_seo_image_attempts', $attempts);
-        $attach_id = $this->generate_featured_image($post_id, $job, false);
+        $attach_id = $this->generate_featured_image($post_id, $job);
         $ai_image_success = $this->ensure_featured_image($post_id, $attach_id);
         
         $fallback_product_image_id = !empty($job['product_image_id'])
@@ -305,7 +314,22 @@ class Agent_SEO_Orchestrator {
             $errors[] = $post_id;
             $batch['image_errors'] = array_values(array_unique($errors));
         }
-        if (empty($batch['pending_images']) && intval(isset($batch['completed']) ? $batch['completed'] : 0) >= intval(isset($batch['total']) ? $batch['total'] : 0)) {
+        $remaining = isset($batch['remaining']) ? intval($batch['remaining']) : 0;
+        $completed = intval(isset($batch['completed']) ? $batch['completed'] : 0);
+        $total = intval(isset($batch['total']) ? $batch['total'] : 0);
+        // Ảnh của bài hiện tại đã xong (thành công hoặc thất bại) → schedule bài tiếp nếu còn.
+        if (empty($batch['pending_images']) && $remaining > 0) {
+            $requested_status = isset($batch['requested_status']) ? $batch['requested_status'] : 'publish';
+            $batch['status'] = 'waiting';
+            $batch['message'] = 'Ảnh bài ' . $completed . '/' . $total . ' đã xong. Đang chuẩn bị bài tiếp theo...';
+            $batch['updated_at'] = time();
+            update_option('aseo_batch_status', $batch, false);
+            if (!wp_next_scheduled('agent_seo_background_task', array($requested_status, $remaining))) {
+                wp_schedule_single_event(time() + 5, 'agent_seo_background_task', array($requested_status, $remaining));
+            }
+            return;
+        }
+        if (empty($batch['pending_images']) && $completed >= $total) {
             $batch['status'] = 'complete';
             $failed_count = !empty($batch['image_errors']) ? count($batch['image_errors']) : 0;
             $batch['message'] = $failed_count > 0
@@ -317,7 +341,7 @@ class Agent_SEO_Orchestrator {
         update_option('aseo_batch_status', $batch, false);
     }
 
-    private function generate_featured_image($post_id, $job, $quick_mode = false) {
+    private function generate_featured_image($post_id, $job) {
         $api_key = get_option('aseo_gemini_api_key', '');
         $duky_key = get_option('aseo_duky_api_key', '');
         $nvidia_key = get_option('aseo_nvidia_api_key', '');
@@ -329,9 +353,6 @@ class Agent_SEO_Orchestrator {
         $title = isset($job['title']) ? $job['title'] : get_the_title($post_id);
         $keyword = isset($job['keyword']) ? $job['keyword'] : '';
         $product_image = isset($job['product_image']) ? $job['product_image'] : '';
-        // Khi quick_mode = true (batch), chỉ poll DukyAI 6 lần (~30s) thay vì 36 lần (~3 phút)
-        // để batch chạy nhanh hơn; ảnh sẽ được retry task xử lý tiếp.
-        $duky_poll_limit = $quick_mode ? 6 : 0;
         $attach_id = false;
         if ($engine === 'imagen' && !empty($api_key)) {
             return Agent_SEO_Gemini_Image::generate_and_save_image($api_key, $prompt, $post_id, $title, $keyword);
@@ -340,7 +361,7 @@ class Agent_SEO_Orchestrator {
             return Agent_SEO_Gemini_Image::generate_and_save_image_nvidia($nvidia_key, $prompt, $post_id, $title, $keyword);
         }
         if (!empty($duky_key)) {
-            $attach_id = Agent_SEO_Gemini_Image::generate_and_save_image_duky($duky_key, $prompt, $post_id, $title, $keyword, $product_image, $duky_poll_limit);
+            $attach_id = Agent_SEO_Gemini_Image::generate_and_save_image_duky($duky_key, $prompt, $post_id, $title, $keyword, $product_image);
         }
         if (!$attach_id && !empty($nvidia_key)) {
             $attach_id = Agent_SEO_Gemini_Image::generate_and_save_image_nvidia($nvidia_key, $prompt, $post_id, $title, $keyword);
@@ -683,16 +704,10 @@ class Agent_SEO_Orchestrator {
         update_post_meta($post_id, '_agent_seo_inline_image_job', $image_job);
         update_post_meta($post_id, '_agent_seo_inline_image_ids', array());
         update_post_meta($post_id, '_agent_seo_image_attempts', 0);
-        // Stagger retry delay theo thứ tự bài trong batch để tránh tranh chấp API DukyAI.
-        $batch = get_option('aseo_batch_status', array());
-        $batch_index = (is_array($batch) && isset($batch['current'])) ? max(0, intval($batch['current']) - 1) : 0;
-        $retry_stagger = 15 + ($batch_index * 30);
         if (!wp_next_scheduled('agent_seo_image_retry_task', array($post_id))) {
-            wp_schedule_single_event(time() + $retry_stagger, 'agent_seo_image_retry_task', array($post_id));
+            wp_schedule_single_event(time() + 15, 'agent_seo_image_retry_task', array($post_id));
         }
-        // Batch mode: quick_mode = true → poll DukyAI tối đa 30s thay vì 3 phút.
-        $is_batch = is_array($batch) && !empty($batch['total']) && intval($batch['total']) > 1;
-        $attach_id = $this->generate_featured_image($post_id, $image_job, $is_batch);
+        $attach_id = $this->generate_featured_image($post_id, $image_job);
         $ai_image_success = $this->ensure_featured_image($post_id, $attach_id);
         $image_is_set = $ai_image_success;
         // Fallback an toàn: nếu AI/CDN lỗi nhưng sản phẩm có ảnh gốc, dùng ảnh sản phẩm
