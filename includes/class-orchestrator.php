@@ -166,8 +166,10 @@ class Agent_SEO_Orchestrator {
         @set_time_limit(600);
         @ini_set('max_execution_time', '600');
         $post_id = intval($post_id);
-        if (get_transient('agent_seo_generation_lock')) {
-            wp_schedule_single_event(time() + 120, 'agent_seo_image_retry_task', array($post_id));
+        // Dùng lock riêng per-post thay vì generation_lock chung để retry ảnh
+        // không bị chặn khi batch đang viết bài tiếp theo.
+        if (get_transient('agent_seo_image_lock_' . $post_id)) {
+            wp_schedule_single_event(time() + 45, 'agent_seo_image_retry_task', array($post_id));
             return;
         }
         if ($post_id <= 0 || !get_post($post_id) || get_post_thumbnail_id($post_id)) {
@@ -181,9 +183,10 @@ class Agent_SEO_Orchestrator {
         if (!is_array($job) || empty($job['prompt'])) {
             return;
         }
+        set_transient('agent_seo_image_lock_' . $post_id, 1, 300);
         $attempts = intval(get_post_meta($post_id, '_agent_seo_image_attempts', true)) + 1;
         update_post_meta($post_id, '_agent_seo_image_attempts', $attempts);
-        $attach_id = $this->generate_featured_image($post_id, $job);
+        $attach_id = $this->generate_featured_image($post_id, $job, false);
         $ai_image_success = $this->ensure_featured_image($post_id, $attach_id);
         
         $fallback_product_image_id = !empty($job['product_image_id'])
@@ -195,11 +198,14 @@ class Agent_SEO_Orchestrator {
             $this->ensure_featured_image($post_id, $fallback_product_image_id);
         }
         
+        delete_transient('agent_seo_image_lock_' . $post_id);
         if ($ai_image_success) {
             $this->clear_image_job($post_id);
             $this->mark_batch_image_finished($post_id, true);
         } elseif ($attempts < 3) {
-            wp_schedule_single_event(time() + 30, 'agent_seo_image_retry_task', array($post_id));
+            // Tăng delay dần theo số lần thử: lần 1 → 45s, lần 2 → 60s
+            $retry_delay = 30 + ($attempts * 15);
+            wp_schedule_single_event(time() + $retry_delay, 'agent_seo_image_retry_task', array($post_id));
         } else {
             $this->clear_image_job($post_id); // Dọn dẹp job sau khi hết số lần thử mà vẫn lỗi AI
             $this->mark_batch_image_finished($post_id, false);
@@ -311,7 +317,7 @@ class Agent_SEO_Orchestrator {
         update_option('aseo_batch_status', $batch, false);
     }
 
-    private function generate_featured_image($post_id, $job) {
+    private function generate_featured_image($post_id, $job, $quick_mode = false) {
         $api_key = get_option('aseo_gemini_api_key', '');
         $duky_key = get_option('aseo_duky_api_key', '');
         $nvidia_key = get_option('aseo_nvidia_api_key', '');
@@ -323,6 +329,9 @@ class Agent_SEO_Orchestrator {
         $title = isset($job['title']) ? $job['title'] : get_the_title($post_id);
         $keyword = isset($job['keyword']) ? $job['keyword'] : '';
         $product_image = isset($job['product_image']) ? $job['product_image'] : '';
+        // Khi quick_mode = true (batch), chỉ poll DukyAI 6 lần (~30s) thay vì 36 lần (~3 phút)
+        // để batch chạy nhanh hơn; ảnh sẽ được retry task xử lý tiếp.
+        $duky_poll_limit = $quick_mode ? 6 : 0;
         $attach_id = false;
         if ($engine === 'imagen' && !empty($api_key)) {
             return Agent_SEO_Gemini_Image::generate_and_save_image($api_key, $prompt, $post_id, $title, $keyword);
@@ -331,7 +340,7 @@ class Agent_SEO_Orchestrator {
             return Agent_SEO_Gemini_Image::generate_and_save_image_nvidia($nvidia_key, $prompt, $post_id, $title, $keyword);
         }
         if (!empty($duky_key)) {
-            $attach_id = Agent_SEO_Gemini_Image::generate_and_save_image_duky($duky_key, $prompt, $post_id, $title, $keyword, $product_image);
+            $attach_id = Agent_SEO_Gemini_Image::generate_and_save_image_duky($duky_key, $prompt, $post_id, $title, $keyword, $product_image, $duky_poll_limit);
         }
         if (!$attach_id && !empty($nvidia_key)) {
             $attach_id = Agent_SEO_Gemini_Image::generate_and_save_image_nvidia($nvidia_key, $prompt, $post_id, $title, $keyword);
@@ -674,10 +683,16 @@ class Agent_SEO_Orchestrator {
         update_post_meta($post_id, '_agent_seo_inline_image_job', $image_job);
         update_post_meta($post_id, '_agent_seo_inline_image_ids', array());
         update_post_meta($post_id, '_agent_seo_image_attempts', 0);
+        // Stagger retry delay theo thứ tự bài trong batch để tránh tranh chấp API DukyAI.
+        $batch = get_option('aseo_batch_status', array());
+        $batch_index = (is_array($batch) && isset($batch['current'])) ? max(0, intval($batch['current']) - 1) : 0;
+        $retry_stagger = 15 + ($batch_index * 30);
         if (!wp_next_scheduled('agent_seo_image_retry_task', array($post_id))) {
-            wp_schedule_single_event(time() + 15, 'agent_seo_image_retry_task', array($post_id));
+            wp_schedule_single_event(time() + $retry_stagger, 'agent_seo_image_retry_task', array($post_id));
         }
-        $attach_id = $this->generate_featured_image($post_id, $image_job);
+        // Batch mode: quick_mode = true → poll DukyAI tối đa 30s thay vì 3 phút.
+        $is_batch = is_array($batch) && !empty($batch['total']) && intval($batch['total']) > 1;
+        $attach_id = $this->generate_featured_image($post_id, $image_job, $is_batch);
         $ai_image_success = $this->ensure_featured_image($post_id, $attach_id);
         $image_is_set = $ai_image_success;
         // Fallback an toàn: nếu AI/CDN lỗi nhưng sản phẩm có ảnh gốc, dùng ảnh sản phẩm

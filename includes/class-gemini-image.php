@@ -214,7 +214,7 @@ class Agent_SEO_Gemini_Image {
      * Create a DukyAI ImageFX task, poll it, download the result and attach it
      * to the correct WordPress post.
      */
-    public static function generate_and_save_image_duky($api_key, $prompt, $post_id = 0, $post_title = '', $keyword = '', $image_url = '') {
+    public static function generate_and_save_image_duky($api_key, $prompt, $post_id = 0, $post_title = '', $keyword = '', $image_url = '', $max_poll_override = 0) {
         if (empty($api_key)) {
             return false;
         }
@@ -284,7 +284,8 @@ class Agent_SEO_Gemini_Image {
         }
 
         // Cho phép chờ tối đa 36 lần (khoảng 3 phút) để chắc chắn AI vẽ xong và lấy được ảnh ngay trong lần chạy đầu tiên.
-        $max_attempts = 36;
+        // Khi chạy batch (quick mode), chỉ poll 6 lần (~30s) rồi để retry task xử lý tiếp.
+        $max_attempts = ($max_poll_override > 0) ? intval($max_poll_override) : 36;
         for ($attempt = 0; $attempt < $max_attempts; $attempt++) {
             if ($attempt > 0) {
                 sleep(5);
