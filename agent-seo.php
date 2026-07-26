@@ -3,7 +3,7 @@
  * Plugin Name: Agent SEO
  * Plugin URI: https://gaocantho.com
  * Description: AI Agent tự động hóa quy trình viết bài chuyên sâu và sinh ảnh thực tế, tự động tối ưu hóa SEO On-page và đi link nội bộ định kỳ.
- * Version: 1.0.0
+ * Version: 1.1.0
  * Author: Tiens0710
  * Author URI: https://gaocantho.com
  * License: GPL2
@@ -16,7 +16,7 @@ defined('ABSPATH') || exit;
 // Định nghĩa các hằng số
 define('ASEO_PATH', plugin_dir_path(__FILE__));
 define('ASEO_URL', plugin_dir_url(__FILE__));
-define('ASEO_VERSION', '1.0.0');
+define('ASEO_VERSION', '1.1.0');
 
 // Nạp các tệp thành phần xử lý logic
 require_once ASEO_PATH . 'includes/class-settings.php';

@@ -330,18 +330,13 @@ class Agent_SEO_Orchestrator {
             return;
         }
         $existing_thumbnail_id = absint(get_post_thumbnail_id($post_id));
-        $reference_image_id = !empty($job['product_image_id'])
-            ? absint($job['product_image_id'])
-            : (!empty($job['product_image']) && function_exists('attachment_url_to_postid')
-                ? absint(attachment_url_to_postid($job['product_image'])) : 0);
-        $thumbnail_is_reference = $existing_thumbnail_id > 0
-            && $reference_image_id > 0
-            && $existing_thumbnail_id === $reference_image_id;
+        $thumbnail_is_ai = $existing_thumbnail_id > 0
+            && get_post_meta($existing_thumbnail_id, '_agent_seo_generated_image', true) === '1';
 
-        // Ảnh tham chiếu tuyệt đối không phải ảnh đại diện AI. Nếu thumbnail
-        // hiện tại trùng ảnh tham chiếu (do fallback phiên bản cũ), xóa nó và
-        // tiếp tục tạo ảnh mới. Thumbnail AI thật chỉ được giữ khi không trùng.
-        if ($existing_thumbnail_id > 0 && ($force_image_retry || $thumbnail_is_reference)) {
+        // Chỉ attachment có dấu nguồn Agent SEO mới được phép làm ảnh đại diện.
+        // Ảnh sản phẩm, ảnh Media tham chiếu hoặc thumbnail do hook ngoài gán
+        // vào đều bị loại trước khi worker tạo ảnh mới.
+        if ($existing_thumbnail_id > 0 && ($force_image_retry || !$thumbnail_is_ai)) {
             delete_post_thumbnail($post_id);
         } elseif ($existing_thumbnail_id > 0) {
             $this->clear_image_job($post_id);
@@ -720,6 +715,9 @@ class Agent_SEO_Orchestrator {
         $nvidia_key = get_option('aseo_nvidia_api_key', '');
         $engine = get_option('aseo_image_engine', 'duky');
         $kaggle_url = get_option('aseo_kaggle_api_url', '');
+        if (!empty($kaggle_url)) {
+            $engine = 'kaggle';
+        }
         $prompt = isset($job['prompt']) ? $job['prompt'] : '';
         $title = isset($job['title']) ? $job['title'] : get_the_title($post_id);
         $keyword = isset($job['keyword']) ? $job['keyword'] : '';
@@ -750,6 +748,35 @@ class Agent_SEO_Orchestrator {
             if (is_wp_error($attach_id) && $attach_id->get_error_code() === 'agent_seo_image_pending') {
                 return $attach_id;
             }
+
+            /*
+             * Ảnh phụ hiện được gọi với model_key = NARWHAL, trong khi ảnh
+             * đại diện không có model_key nên dùng model cấu hình (thường là
+             * GEM_PIX_2). Khi GEM_PIX_2 hết quota, ảnh phụ vẫn tạo được nhưng
+             * ảnh chính thất bại. Với ảnh đại diện, tự thử NARWHAL một lần
+             * nữa để dùng cùng model đang hoạt động cho ảnh phụ.
+             *
+             * Chỉ fallback khi không có model override (tức ảnh đại diện);
+             * không thay đổi luồng ảnh phụ và không fallback khi tác vụ đang
+             * chờ tải ảnh về.
+             */
+            if (
+                $set_thumbnail
+                && empty($duky_model_override)
+                && (!$attach_id || is_wp_error($attach_id))
+            ) {
+                delete_post_meta($post_id, '_agent_seo_duky_media_id');
+                error_log('Agent SEO Duky: featured image model failed; retrying with NARWHAL.');
+                $attach_id = Agent_SEO_Gemini_Image::generate_and_save_image_duky($duky_key, $prompt, $post_id, $title, $keyword, $product_image, true, 'NARWHAL');
+                if (is_wp_error($attach_id) && $attach_id->get_error_code() === 'agent_seo_image_pending') {
+                    return $attach_id;
+                }
+            }
+            // Các lỗi Duky khác là lỗi cứng của lượt này; chuẩn hóa về false
+            // để worker có thể retry đúng cách hoặc thử engine dự phòng.
+            if (is_wp_error($attach_id)) {
+                $attach_id = false;
+            }
         }
         if (!$attach_id && !empty($nvidia_key)) {
             $attach_id = Agent_SEO_Gemini_Image::generate_and_save_image_nvidia($nvidia_key, $prompt, $post_id, $title, $keyword, $set_thumbnail);
@@ -763,7 +790,12 @@ class Agent_SEO_Orchestrator {
     private function ensure_featured_image($post_id, $attach_id) {
         $post_id = intval($post_id);
         $attach_id = intval($attach_id);
-        if ($post_id <= 0 || $attach_id <= 0 || !wp_attachment_is_image($attach_id)) {
+        if (
+            $post_id <= 0
+            || $attach_id <= 0
+            || !wp_attachment_is_image($attach_id)
+            || get_post_meta($attach_id, '_agent_seo_generated_image', true) !== '1'
+        ) {
             return false;
         }
         set_post_thumbnail($post_id, $attach_id);
@@ -1083,6 +1115,13 @@ class Agent_SEO_Orchestrator {
         $post_id = wp_insert_post($post_data);
         if (is_wp_error($post_id)) {
             return array('success' => false, 'message' => 'Lỗi đăng bài viết vào WordPress: ' . $post_id->get_error_message());
+        }
+        $inserted_thumbnail_id = absint(get_post_thumbnail_id($post_id));
+        if (
+            $inserted_thumbnail_id > 0
+            && get_post_meta($inserted_thumbnail_id, '_agent_seo_generated_image', true) !== '1'
+        ) {
+            delete_post_thumbnail($post_id);
         }
         if ($this->is_batch_stopped($batch_started_at)) {
             // Bài đã được lưu nên đánh dấu topic đã dùng, tránh batch sau tạo trùng.

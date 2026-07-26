@@ -543,6 +543,7 @@ class Agent_SEO_Gemini_Image {
     public static function generate_and_save_image_kaggle($kaggle_url, $prompt, $post_id = 0, $post_title = '', $keyword = '', $image_url = '', $set_thumbnail = true) {
         if (empty($image_url)) {
             error_log('Agent SEO Image Google Flow Error: Missing product reference image URL. Select a WooCommerce product with a featured image.');
+            update_option('aseo_last_google_flow_error', array('stage' => 'REFERENCE', 'message' => 'Thiếu URL ảnh tham chiếu.', 'time' => time()), false);
             return false;
         }
 
@@ -557,6 +558,7 @@ class Agent_SEO_Gemini_Image {
 
         if (is_wp_error($response)) {
             error_log('Agent SEO Image Google Flow Error: ' . $response->get_error_message());
+            update_option('aseo_last_google_flow_error', array('stage' => 'REQUEST', 'message' => $response->get_error_message(), 'time' => time()), false);
             return false;
         }
 
@@ -565,6 +567,9 @@ class Agent_SEO_Gemini_Image {
 
         if ($code !== 200) {
             error_log('Agent SEO Image Google Flow API Error (HTTP ' . $code . '): ' . $res_body);
+            $error_data = json_decode($res_body, true);
+            $error_message = isset($error_data['error']) ? sanitize_text_field($error_data['error']) : 'HTTP ' . $code;
+            update_option('aseo_last_google_flow_error', array('stage' => 'API', 'message' => $error_message, 'time' => time()), false);
             return false;
         }
 
@@ -573,11 +578,18 @@ class Agent_SEO_Gemini_Image {
 
         if (empty($base64_data)) {
             error_log('Agent SEO Image Google Flow Error: Base64 data is empty.');
+            update_option('aseo_last_google_flow_error', array('stage' => 'RESPONSE', 'message' => 'API không trả về trường image Base64.', 'time' => time()), false);
             return false;
         }
 
         // Thực hiện lưu trữ file ảnh vào WordPress
-        return self::sideload_base64_image($base64_data, $post_title, $post_id, $keyword, $set_thumbnail);
+        $attach_id = self::sideload_base64_image($base64_data, $post_title, $post_id, $keyword, $set_thumbnail);
+        if (!$attach_id) {
+            update_option('aseo_last_google_flow_error', array('stage' => 'MEDIA', 'message' => 'Không thể lưu ảnh Base64 vào Media Library.', 'time' => time()), false);
+            return false;
+        }
+        delete_option('aseo_last_google_flow_error');
+        return $attach_id;
     }
 
     /**
@@ -639,6 +651,8 @@ class Agent_SEO_Gemini_Image {
             // Đặt alt text cho ảnh trùng khớp với từ khóa chính phục vụ SEO Rank Math
             $alt_text = !empty($keyword) ? $keyword : $title;
             update_post_meta($attach_id, '_wp_attachment_image_alt', sanitize_text_field($alt_text));
+            update_post_meta($attach_id, '_agent_seo_generated_image', '1');
+            update_post_meta($attach_id, '_agent_seo_generated_for_post', absint($post_id));
 
             // Chỉ gán thumbnail khi được yêu cầu (ảnh đại diện), bỏ qua cho ảnh phụ.
             if ($set_thumbnail && $post_id > 0) {

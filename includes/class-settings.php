@@ -12,7 +12,6 @@ class Agent_SEO_Settings {
         add_action('admin_init', array($this, 'register_settings'));
         add_action('admin_init', array($this, 'handle_actions'));
         add_action('admin_enqueue_scripts', array($this, 'enqueue_admin_assets'));
-        add_action('admin_enqueue_scripts', array($this, 'enqueue_admin_assets'));
         add_action('wp_ajax_agent_seo_batch_status', array($this, 'ajax_batch_status'));
         add_action('wp_ajax_agent_seo_save_product', array($this, 'ajax_save_product'));
         add_action('wp_ajax_agent_seo_autosave_setting', array($this, 'ajax_autosave_setting'));
@@ -173,6 +172,9 @@ class Agent_SEO_Settings {
             $value = sanitize_text_field($value);
         }
         update_option($field, $value);
+        if ($field === 'aseo_kaggle_api_url' && !empty($value)) {
+            update_option('aseo_image_engine', 'kaggle');
+        }
         wp_send_json_success(array('field' => $field));
     }
 
@@ -524,6 +526,10 @@ class Agent_SEO_Settings {
             if (empty($image_engine_sel)) {
                 $image_engine_sel = get_option('aseo_image_engine', 'duky');
             }
+            if (!empty($kaggle_url)) {
+                $image_engine_sel = 'kaggle';
+                update_option('aseo_image_engine', 'kaggle');
+            }
 
             // Gọi thử kết nối Image API dựa trên Lựa chọn Bộ máy sinh ảnh
             if ($image_engine_sel === 'duky') {
@@ -752,6 +758,7 @@ class Agent_SEO_Settings {
         $api_key = get_option('aseo_gemini_api_key', '');
         $nvidia_api_key = get_option('aseo_nvidia_api_key', '');
         $kaggle_api_url = get_option('aseo_kaggle_api_url', '');
+        $last_google_flow_error = get_option('aseo_last_google_flow_error', array());
         $duky_api_key = get_option('aseo_duky_api_key', '');
         $last_duky_error = get_option('aseo_last_duky_error', array());
         $indexnow_key = get_option('aseo_indexnow_key', '');
@@ -767,6 +774,12 @@ class Agent_SEO_Settings {
         }
         $image_engine = get_option('aseo_image_engine', 'duky');
         $enable_inline_images = get_option('aseo_enable_inline_images', '0') === '1';
+        if (!empty($kaggle_api_url)) {
+            $image_engine = 'kaggle';
+            if (get_option('aseo_image_engine', '') !== 'kaggle') {
+                update_option('aseo_image_engine', 'kaggle');
+            }
+        }
         $niche = get_option('aseo_niche', 'Sản phẩm, dịch vụ và lĩnh vực kinh doanh của website');
         $brand_voice = get_option('aseo_brand_voice', 'Chuyên nghiệp, tin cậy, rõ ràng và phù hợp với khách hàng mục tiêu');
         $keywords = get_option('aseo_keywords', '');
@@ -1183,6 +1196,8 @@ class Agent_SEO_Settings {
                 border-radius: 999px; background: #dcfce7; color: #166534; font-size: .72rem; font-weight: 700;
             }
             #aseo-panel-api .aseo-field:has(#aseo_nvidia_api_key) { display: none; }
+            #aseo-panel-api .aseo-field:has(#aseo_duky_api_key),
+            #aseo-panel-api .aseo-field:has(#aseo_duky_model) { display: none; }
             #aseo_image_engine option[value="nvidia"] { display: none; }
             #aseo-panel-api .aseo-field:has(#aseo_primary_keyword) { display: none; }
             #aseo-panel-seo .aseo-section:has(#aseo_keywords) { display: none; }
@@ -1431,7 +1446,7 @@ class Agent_SEO_Settings {
                 </div>
                 <div class="aseo-header-right">
                     <span class="aseo-status-dot">Đang hoạt động</span>
-                    <span class="aseo-badge">v1.0</span>
+                    <span class="aseo-badge">v<?php echo esc_html(ASEO_VERSION); ?></span>
                 </div>
             </div>
 
@@ -1627,9 +1642,6 @@ class Agent_SEO_Settings {
                                         <p class="desc">Chọn công nghệ để tự động sinh ảnh đại diện cho mỗi bài viết.</p>
                                         <select id="aseo_image_engine" name="aseo_image_engine">
                                             <option value="kaggle" <?php selected($image_engine, 'kaggle'); ?>>Google Flow (Playwright API)</option>
-                                            <option value="duky" <?php selected($image_engine, 'duky'); ?>>DukyAI ImageFX</option>
-                                            <option value="nvidia" <?php selected($image_engine, 'nvidia'); ?>>NVIDIA FLUX.2 (Chất lượng cao)</option>
-                                            <option value="imagen" <?php selected($image_engine, 'imagen'); ?>>Gemini Imagen 4 (Trả phí)</option>
                                         </select>
                                     </div>
                                     <div class="aseo-field aseo-fg-full">
@@ -1637,6 +1649,12 @@ class Agent_SEO_Settings {
                                         <p class="desc">Dán URL public tới Flask server, ví dụ https://ten-mien.trycloudflare.com/generate</p>
                                         <input type="url" id="aseo_kaggle_api_url" name="aseo_kaggle_api_url" value="<?php echo esc_attr($kaggle_api_url); ?>" placeholder="https://...trycloudflare.com/generate">
                                     </div>
+                                    <?php if ($image_engine === 'kaggle' && is_array($last_google_flow_error) && !empty($last_google_flow_error['message'])) : ?>
+                                    <div class="aseo-field aseo-fg-full" style="border:1px solid #fecaca;background:#fff7f7;padding:12px 14px;border-radius:10px;">
+                                        <strong style="color:#b91c1c;">Lỗi Google Flow gần nhất:</strong>
+                                        <span><?php echo esc_html(strtoupper(isset($last_google_flow_error['stage']) ? $last_google_flow_error['stage'] : 'API') . ' — ' . $last_google_flow_error['message']); ?></span>
+                                    </div>
+                                    <?php endif; ?>
                                     <div class="aseo-field">
                                         <label><span class="field-icon">🔑</span> DukyAI API Key</label>
                                         <p class="desc">API tạo ảnh trực tiếp, không cần chạy Google Flow bot hoặc Cloudflare Tunnel.</p>
@@ -1651,7 +1669,7 @@ class Agent_SEO_Settings {
                                             <option value="R2I" <?php selected($duky_model, 'R2I'); ?>>R2I — Imagen 4</option>
                                         </select>
                                     </div>
-                                    <?php if (is_array($last_duky_error) && !empty($last_duky_error['message'])) : ?>
+                                    <?php if ($image_engine === 'duky' && is_array($last_duky_error) && !empty($last_duky_error['message'])) : ?>
                                     <div class="aseo-field aseo-fg-full" style="border:1px solid #fecaca;background:#fff7f7;padding:12px 14px;border-radius:10px;">
                                         <strong style="color:#b91c1c;">Lỗi DukyAI gần nhất:</strong>
                                         <span><?php echo esc_html(
