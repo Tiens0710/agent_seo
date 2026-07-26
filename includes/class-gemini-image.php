@@ -57,7 +57,7 @@ class Agent_SEO_Gemini_Image {
      * Sinh ảnh từ mô tả của Gemini Imagen 4 và lưu vào hệ thống
      * Trả về Attachment ID trong WordPress hoặc false nếu thất bại
      */
-    public static function generate_and_save_image($api_key, $prompt, $post_id = 0, $post_title = '', $keyword = '') {
+    public static function generate_and_save_image($api_key, $prompt, $post_id = 0, $post_title = '', $keyword = '', $set_thumbnail = true) {
         $url = 'https://generativelanguage.googleapis.com/v1beta/models/imagen-4.0-generate-001:predict?key=' . $api_key;
 
         // Bổ sung các từ khóa kỹ thuật nhiếp ảnh thương mại cao cấp sạch sẽ, ánh sáng ban ngày lạnh sạch
@@ -102,7 +102,7 @@ class Agent_SEO_Gemini_Image {
         }
 
         // Thực hiện lưu trữ file ảnh vào WordPress
-        return self::sideload_base64_image($base64_data, $post_title, $post_id, $keyword);
+        return self::sideload_base64_image($base64_data, $post_title, $post_id, $keyword, $set_thumbnail);
     }
 
     /**
@@ -211,10 +211,27 @@ class Agent_SEO_Gemini_Image {
     }
 
     /**
+     * Cập nhật progress bar với số giây đã chờ DukyAI vẽ xong (gọi trong lúc polling).
+     */
+    private static function report_wait_progress($elapsed_seconds, $max_seconds) {
+        $stage = get_option('aseo_image_wait_stage', array());
+        if (!is_array($stage) || empty($stage['label'])) {
+            return;
+        }
+        $batch = get_option('aseo_batch_status', array());
+        if (!is_array($batch) || empty($batch['total'])) {
+            return;
+        }
+        $batch['message'] = $stage['label'] . '... (đã chờ ' . $elapsed_seconds . '/' . $max_seconds . ' giây)';
+        $batch['updated_at'] = time();
+        update_option('aseo_batch_status', $batch, false);
+    }
+
+    /**
      * Create a DukyAI ImageFX task, poll it, download the result and attach it
      * to the correct WordPress post.
      */
-    public static function generate_and_save_image_duky($api_key, $prompt, $post_id = 0, $post_title = '', $keyword = '', $image_url = '') {
+    public static function generate_and_save_image_duky($api_key, $prompt, $post_id = 0, $post_title = '', $keyword = '', $image_url = '', $set_thumbnail = true) {
         if (empty($api_key)) {
             return false;
         }
@@ -289,6 +306,7 @@ class Agent_SEO_Gemini_Image {
             if ($attempt > 0) {
                 sleep(5);
             }
+            self::report_wait_progress($attempt * 5, $max_attempts * 5);
             $check = wp_remote_post('https://api-v1.dukyai.com/api/image-task/check', array(
                 'headers' => $headers,
                 'body' => wp_json_encode(array('mediaId' => $media_id)),
@@ -305,12 +323,47 @@ class Agent_SEO_Gemini_Image {
                 if (strpos($result_url, '/') === 0) {
                     $result_url = 'https://api-v1.dukyai.com' . $result_url;
                 }
-                // CDN có thể trả 404/502 trong vài giây đầu; giữ task lại để poll và tải lại thay vì bỏ ngay.
+                // Dùng /api/download-image proxy để bypass CORS và link GCS hết hạn.
                 for ($download_attempt = 0; $download_attempt < 3; $download_attempt++) {
-                    $download = wp_remote_get(esc_url_raw($result_url), array('timeout' => 60, 'redirection' => 3));
+                    $download = wp_remote_post('https://api-v1.dukyai.com/api/download-image', array(
+                        'headers' => $headers,
+                        'body'    => wp_json_encode(array('imageUrl' => $result_url)),
+                        'timeout' => 60
+                    ));
                     if (!is_wp_error($download) && wp_remote_retrieve_response_code($download) === 200) {
+                        $content_type = wp_remote_retrieve_header($download, 'content-type');
                         $download_body = wp_remote_retrieve_body($download);
-                        $attach_id = self::sideload_base64_image(base64_encode($download_body), $post_title, $post_id, $keyword);
+                        // Nếu proxy trả JSON (có thể chứa encodedImage base64), xử lý riêng.
+                        if (!empty($content_type) && strpos($content_type, 'application/json') !== false) {
+                            $proxy_data = json_decode($download_body, true);
+                            if (!empty($proxy_data['encodedImage'])) {
+                                $download_body = base64_decode($proxy_data['encodedImage']);
+                            } elseif (!empty($proxy_data['error'])) {
+                                error_log('Agent SEO DukyAI download-image error: ' . $proxy_data['error']);
+                                if ($download_attempt < 2) { sleep(3); }
+                                continue;
+                            }
+                        }
+                        if (!empty($download_body) && strlen($download_body) > 1000) {
+                            $attach_id = self::sideload_base64_image(base64_encode($download_body), $post_title, $post_id, $keyword, $set_thumbnail);
+                            if ($attach_id && $post_id > 0) {
+                                delete_post_meta($post_id, '_agent_seo_duky_media_id');
+                            }
+                            if ($attach_id) {
+                                return $attach_id;
+                            }
+                        }
+                    }
+                    if ($download_attempt < 2) {
+                        sleep(3);
+                    }
+                }
+                // Fallback: thử tải trực tiếp URL GCS nếu proxy không thành công.
+                $direct_download = wp_remote_get(esc_url_raw($result_url), array('timeout' => 60, 'redirection' => 3));
+                if (!is_wp_error($direct_download) && wp_remote_retrieve_response_code($direct_download) === 200) {
+                    $download_body = wp_remote_retrieve_body($direct_download);
+                    if (!empty($download_body) && strlen($download_body) > 1000) {
+                        $attach_id = self::sideload_base64_image(base64_encode($download_body), $post_title, $post_id, $keyword, $set_thumbnail);
                         if ($attach_id && $post_id > 0) {
                             delete_post_meta($post_id, '_agent_seo_duky_media_id');
                         }
@@ -318,11 +371,7 @@ class Agent_SEO_Gemini_Image {
                             return $attach_id;
                         }
                     }
-                    if ($download_attempt < 2) {
-                        sleep(2);
-                    }
                 }
-                // Thử lại lần poll kế tiếp; không xóa mediaId khi CDN chưa sẵn sàng.
                 continue;
             }
             if (in_array($status, array('failed', 'error', 'cancelled'), true)) {
@@ -341,7 +390,7 @@ class Agent_SEO_Gemini_Image {
     /**
      * Sinh ảnh từ mô tả bằng NVIDIA NIM FLUX API và lưu vào hệ thống
      */
-    public static function generate_and_save_image_nvidia($nvidia_key, $prompt, $post_id = 0, $post_title = '', $keyword = '') {
+    public static function generate_and_save_image_nvidia($nvidia_key, $prompt, $post_id = 0, $post_title = '', $keyword = '', $set_thumbnail = true) {
         $url = 'https://ai.api.nvidia.com/v1/genai/black-forest-labs/flux.2-klein-4b';
 
         // Bổ sung các từ khóa kỹ thuật nhiếp ảnh thương mại cao cấp sạch sẽ, ánh sáng ban ngày lạnh sạch
@@ -387,7 +436,7 @@ class Agent_SEO_Gemini_Image {
         }
 
         // Thực hiện lưu trữ file ảnh vào WordPress
-        return self::sideload_base64_image($base64_data, $post_title, $post_id, $keyword);
+        return self::sideload_base64_image($base64_data, $post_title, $post_id, $keyword, $set_thumbnail);
     }
 
     /**
@@ -436,7 +485,7 @@ class Agent_SEO_Gemini_Image {
     /**
      * Chuyển đổi Base64 và đưa vào WordPress Media Library
      */
-    private static function sideload_base64_image($base64_data, $title, $post_id = 0, $keyword = '') {
+    private static function sideload_base64_image($base64_data, $title, $post_id = 0, $keyword = '', $set_thumbnail = true) {
         // Cần nạp các file quản lý upload của WordPress core
         require_once(ABSPATH . 'wp-admin/includes/image.php');
         require_once(ABSPATH . 'wp-admin/includes/file.php');
@@ -493,8 +542,8 @@ class Agent_SEO_Gemini_Image {
             $alt_text = !empty($keyword) ? $keyword : $title;
             update_post_meta($attach_id, '_wp_attachment_image_alt', sanitize_text_field($alt_text));
 
-            // Gán làm ảnh tiêu biểu nếu có post_id
-            if ($post_id > 0) {
+            // Chỉ gán thumbnail khi được yêu cầu (ảnh đại diện), bỏ qua cho ảnh phụ.
+            if ($set_thumbnail && $post_id > 0) {
                 set_post_thumbnail($post_id, $attach_id);
                 if (intval(get_post_thumbnail_id($post_id)) !== intval($attach_id)) {
                     update_post_meta($post_id, '_thumbnail_id', intval($attach_id));

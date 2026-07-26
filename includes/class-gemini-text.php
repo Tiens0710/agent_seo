@@ -233,6 +233,17 @@ Yêu cầu bài viết để chuẩn E-E-A-T của Google:
             $normalized_secondary_keywords = preg_replace('/[\r\n]+/', ', ', $global_secondary_keywords);
             $prompt .= "\nMANDATORY SHARED SECONDARY KEYWORDS FOR EVERY ARTICLE: {$normalized_secondary_keywords}. Include these phrases naturally where relevant, without keyword stuffing. They are supporting keywords only; never replace the primary keyword \"{$keyword}\".\n";
         }
+
+        // Chống trùng lặp nội dung: truyền danh sách bài đã viết trước đó cho AI.
+        $existing_titles = isset($brand_data['existing_article_titles']) && is_array($brand_data['existing_article_titles']) ? $brand_data['existing_article_titles'] : array();
+        if (!empty($existing_titles)) {
+            $titles_list = '';
+            foreach (array_slice($existing_titles, 0, 20) as $idx => $et) {
+                $titles_list .= ($idx + 1) . '. ' . $et . "\n";
+            }
+            $prompt .= "\nCONTENT UNIQUENESS — CRITICAL ANTI-DUPLICATION RULE:\nThe following articles have ALREADY been published on this website. Your new article MUST be substantially different from ALL of them:\n" . $titles_list . "\nSpecific requirements to ensure uniqueness:\n- Choose a DIFFERENT angle, narrative structure and set of H2/H3 headings from every article listed above.\n- Do NOT reuse the same opening paragraph pattern, the same list of tips/criteria, or the same comparison table structure.\n- Vary your storytelling approach: if previous articles used listicles, use a case-study or how-to guide format instead; if they used expert advice format, use a buyer's journey or problem-solution format.\n- The seo_title MUST be clearly distinct from all titles above — different wording, different hook, different number if using numbers.\n- Cover aspects of the topic that the existing articles have NOT covered yet.\n";
+        }
+
         $prompt .= "\nFINAL SEO SAFETY RULE: Keep the exact primary keyword \"{$keyword}\" to a maximum of 8-10 natural occurrences in the full HTML content. Use semantic variants afterward, avoid repeating it in every paragraph, table cell, CTA and product box, and never force a sentence just to increase keyword density.\n";
 
         $body = array(

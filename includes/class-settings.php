@@ -182,19 +182,34 @@ class Agent_SEO_Settings {
                 }
             }
         }
-        if (isset($batch['status']) && $batch['status'] === 'images_pending' && !empty($batch['pending_inline_images']) && is_array($batch['pending_inline_images'])) {
+        if (isset($batch['status']) && $batch['status'] === 'images_pending') {
             $last_inline_kick = intval(isset($batch['last_inline_kick_at']) ? $batch['last_inline_kick_at'] : 0);
             if (time() - $last_inline_kick >= 15) {
-                foreach ($batch['pending_inline_images'] as $pending_post_id) {
-                    $pending_post_id = absint($pending_post_id);
-                    if ($pending_post_id > 0 && !wp_next_scheduled('agent_seo_inline_image_task', array($pending_post_id))) {
-                        wp_schedule_single_event(time(), 'agent_seo_inline_image_task', array($pending_post_id));
+                $kicked = false;
+                if (!empty($batch['pending_images']) && is_array($batch['pending_images'])) {
+                    foreach ($batch['pending_images'] as $pending_post_id) {
+                        $pending_post_id = absint($pending_post_id);
+                        if ($pending_post_id > 0 && !wp_next_scheduled('agent_seo_image_retry_task', array($pending_post_id))) {
+                            wp_schedule_single_event(time(), 'agent_seo_image_retry_task', array($pending_post_id));
+                            $kicked = true;
+                        }
                     }
                 }
-                $batch['last_inline_kick_at'] = time();
-                update_option('aseo_batch_status', $batch, false);
-                if (function_exists('spawn_cron')) {
-                    spawn_cron(time());
+                if (!empty($batch['pending_inline_images']) && is_array($batch['pending_inline_images'])) {
+                    foreach ($batch['pending_inline_images'] as $pending_post_id) {
+                        $pending_post_id = absint($pending_post_id);
+                        if ($pending_post_id > 0 && !wp_next_scheduled('agent_seo_inline_image_task', array($pending_post_id))) {
+                            wp_schedule_single_event(time(), 'agent_seo_inline_image_task', array($pending_post_id));
+                            $kicked = true;
+                        }
+                    }
+                }
+                if ($kicked) {
+                    $batch['last_inline_kick_at'] = time();
+                    update_option('aseo_batch_status', $batch, false);
+                    if (function_exists('spawn_cron')) {
+                        spawn_cron(time());
+                    }
                 }
             }
         }
@@ -946,7 +961,19 @@ class Agent_SEO_Settings {
             .aseo-header .updated,
             .aseo-header .error,
             .aseo-header .e-notice,
-            .aseo-header div[class*="notice"] {
+            .aseo-header div[class*="notice"],
+            #wpbody-content > .notice,
+            #wpbody-content > .updated,
+            #wpbody-content > .error,
+            #wpbody-content > .update-nag,
+            #wpbody-content > .notice-warning,
+            #wpbody-content > .notice-info,
+            #wpbody-content > .notice-success,
+            #wpbody-content > .notice-error,
+            #wpbody-content > div.error,
+            #wpbody-content > div.updated,
+            #wpbody-content > div.update-nag,
+            #wpbody-content > div[class*="notice"] {
                 display: none !important;
             }
             .aseo-progress-card { display:none; margin:0 0 22px; padding:18px 20px; border:1px solid #cfe3d6; border-radius:14px; background:#f7fcf8; }

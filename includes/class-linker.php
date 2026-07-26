@@ -20,12 +20,14 @@ class Agent_SEO_Linker {
         $current_content = $current_post->post_content;
         $current_url     = get_permalink($post_id);
 
-        // Lấy toàn bộ danh sách các bài viết khác
+        // Lấy danh sách 100 bài viết mới nhất để đi link chéo (tránh làm tràn bộ nhớ khi web có hàng ngàn bài)
         $other_posts = get_posts(array(
-            'post_type'    => 'post',
-            'post_status'  => 'publish',
-            'numberposts'  => -1,
-            'exclude'      => array($post_id)
+            'post_type'      => 'post',
+            'post_status'    => 'publish',
+            'posts_per_page' => 100,
+            'orderby'        => 'date',
+            'order'          => 'DESC',
+            'exclude'        => array($post_id)
         ));
 
         if (empty($other_posts)) {
@@ -88,7 +90,7 @@ class Agent_SEO_Linker {
      * Chèn thẻ liên kết <a> vào nội dung văn bản một cách an toàn mà không phá vỡ HTML
      */
     private static function insert_link_safely($content, $phrase, $link_url) {
-        if (empty($phrase) || strlen($phrase) < 4) {
+        if (empty($phrase) || mb_strlen($phrase, 'UTF-8') < 6) {
             return $content;
         }
 
@@ -115,8 +117,9 @@ class Agent_SEO_Linker {
                 if (!$in_anchor && !$replaced) {
                     $quoted_phrase = preg_quote($phrase, '/');
                     
-                    // Regex tìm kiếm không phân biệt chữ hoa/thường
-                    $pattern = '/' . $quoted_phrase . '/iu';
+                    // Sử dụng lookbehind và lookahead với class ký tự Unicode (\p{L}, \p{N})
+                    // để chặn ranh giới từ tiếng Việt chuẩn xác nhất mà không phân biệt chữ hoa/thường
+                    $pattern = '/(?<![\p{L}\p{N}])' . $quoted_phrase . '(?![\p{L}\p{N}])/iu';
                     
                     if (preg_match($pattern, $part)) {
                         // Chỉ thay thế từ khóa đầu tiên xuất hiện
