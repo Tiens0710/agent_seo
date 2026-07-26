@@ -108,7 +108,7 @@ class Agent_SEO_Orchestrator {
             $batch['current'] = $current;
             $batch['remaining'] = $remaining;
             $batch['requested_status'] = $requested_status;
-            $batch['message'] = 'Đang viết nội dung và tạo ảnh cho bài ' . $current . '/' . intval($batch['total']) . '...';
+            $batch['message'] = 'Đang viết nội dung bài ' . $current . '/' . intval($batch['total']) . '...';
             $batch['updated_at'] = time();
             update_option('aseo_batch_status', $batch, false);
         }
@@ -146,17 +146,11 @@ class Agent_SEO_Orchestrator {
                     $batch['pending_inline_images'] = array_values(array_unique($pending_inline));
                 }
             }
-            // Lưu remaining và requested_status vào batch để mark_batch_image_finished
-            // có thể schedule bài tiếp theo khi ảnh hoàn tất.
             $batch['remaining'] = $remaining;
             $batch['requested_status'] = $requested_status;
-            if (!empty($result['image_warning']) && $remaining > 0) {
-                // Ảnh chưa xong → chờ image retry hoàn tất rồi mới sang bài tiếp.
-                $batch['status'] = 'images_pending';
-                $batch['message'] = 'Bài ' . intval($batch['completed']) . '/' . intval($batch['total']) . ' đã viết xong. Đang chờ tạo ảnh đại diện/ảnh phụ trước khi sang bài tiếp...';
-            } elseif ($remaining > 0) {
+            if ($remaining > 0) {
                 $batch['status'] = 'waiting';
-                $batch['message'] = 'Đã hoàn tất bài ' . intval($batch['completed']) . '/' . intval($batch['total']) . '. Đang chuẩn bị bài tiếp theo...';
+                $batch['message'] = 'Đã lưu bài ' . intval($batch['completed']) . '/' . intval($batch['total']) . '. Ảnh đang chạy nền; hệ thống đang chuẩn bị bài tiếp theo...';
             } else {
                 $batch['completed'] = intval($batch['total']);
                 $total_pending = intval(!empty($batch['pending_images']) ? count($batch['pending_images']) : 0) + intval(!empty($batch['pending_inline_images']) ? count($batch['pending_inline_images']) : 0);
@@ -171,9 +165,9 @@ class Agent_SEO_Orchestrator {
             }
             update_option('aseo_batch_status', $batch, false);
         }
-        // Chỉ schedule bài tiếp khi ảnh đã hoàn tất (không có image_warning).
-        // Nếu ảnh lỗi, mark_batch_image_finished sẽ schedule bài tiếp khi retry xong.
-        if ($remaining > 0 && empty($result['image_warning'])) {
+        // Viết bài tiếp theo độc lập với tiến trình tạo ảnh. Image worker có lock
+        // riêng theo từng post nên không còn kéo dài hoặc chặn content worker.
+        if ($remaining > 0) {
             wp_schedule_single_event(time() + 5, 'agent_seo_background_task', array($requested_status, $remaining));
         }
         delete_transient('agent_seo_generation_lock');
@@ -201,9 +195,31 @@ class Agent_SEO_Orchestrator {
             return;
         }
         set_transient('agent_seo_image_lock_' . $post_id, 1, 300);
-        $attempts = intval(get_post_meta($post_id, '_agent_seo_image_attempts', true)) + 1;
+        $attempts = intval(get_post_meta($post_id, '_agent_seo_image_attempts', true));
+        $attach_id = $this->generate_featured_image($post_id, $job, 'Đang xử lý ảnh đại diện' . $this->stage_progress_suffix());
+        if (is_wp_error($attach_id) && $attach_id->get_error_code() === 'agent_seo_image_pending') {
+            $polls = intval(get_post_meta($post_id, '_agent_seo_image_polls', true)) + 1;
+            update_post_meta($post_id, '_agent_seo_image_polls', $polls);
+            delete_transient('agent_seo_image_lock_' . $post_id);
+            if ($polls < 60) {
+                wp_schedule_single_event(time() + 15, 'agent_seo_image_retry_task', array($post_id));
+            } else {
+                delete_post_meta($post_id, '_agent_seo_duky_media_id');
+                delete_post_meta($post_id, '_agent_seo_image_polls');
+                $attempts++;
+                update_post_meta($post_id, '_agent_seo_image_attempts', $attempts);
+                if ($attempts < 3) {
+                    wp_schedule_single_event(time() + 30, 'agent_seo_image_retry_task', array($post_id));
+                } else {
+                    $this->clear_image_job($post_id);
+                    $this->check_and_progress_image_flow($post_id);
+                }
+            }
+            return;
+        }
+        delete_post_meta($post_id, '_agent_seo_image_polls');
+        $attempts++;
         update_post_meta($post_id, '_agent_seo_image_attempts', $attempts);
-        $attach_id = $this->generate_featured_image($post_id, $job, 'Đang thử lại ảnh đại diện (lần ' . $attempts . '/3)' . $this->stage_progress_suffix());
         $ai_image_success = $this->ensure_featured_image($post_id, $attach_id);
         
         $fallback_product_image_id = !empty($job['product_image_id'])
@@ -253,7 +269,6 @@ class Agent_SEO_Orchestrator {
             $this->check_and_progress_image_flow($post_id);
             return;
         }
-        update_post_meta($post_id, '_agent_seo_inline_image_attempts', $inline_attempts + 1);
         set_transient('agent_seo_inline_image_lock_' . $post_id, 1, 600);
         $variant_index = count($inline_ids) + 1;
         $variant_prompts = array(
@@ -266,6 +281,29 @@ class Agent_SEO_Orchestrator {
         $inline_job['title'] = $job['title'] . ' - Minh hoa ' . $variant_index;
         // Sinh ảnh phụ KHÔNG gán thumbnail để tránh cướp ảnh đại diện.
         $attach_id = $this->generate_inline_image($post_id, $inline_job, 'Đang tạo ảnh minh họa (lần thử ' . ($inline_attempts + 1) . '/3)' . $this->stage_progress_suffix());
+        if (is_wp_error($attach_id) && $attach_id->get_error_code() === 'agent_seo_image_pending') {
+            $polls = intval(get_post_meta($post_id, '_agent_seo_inline_image_polls', true)) + 1;
+            update_post_meta($post_id, '_agent_seo_inline_image_polls', $polls);
+            delete_transient('agent_seo_inline_image_lock_' . $post_id);
+            if ($polls < 60) {
+                wp_schedule_single_event(time() + 15, 'agent_seo_inline_image_task', array($post_id));
+            } else {
+                delete_post_meta($post_id, '_agent_seo_duky_media_id');
+                delete_post_meta($post_id, '_agent_seo_inline_image_polls');
+                $inline_attempts++;
+                update_post_meta($post_id, '_agent_seo_inline_image_attempts', $inline_attempts);
+                if ($inline_attempts < 3) {
+                    wp_schedule_single_event(time() + 30, 'agent_seo_inline_image_task', array($post_id));
+                } else {
+                    delete_post_meta($post_id, '_agent_seo_inline_image_job');
+                    delete_post_meta($post_id, '_agent_seo_inline_image_attempts');
+                    $this->check_and_progress_image_flow($post_id);
+                }
+            }
+            return;
+        }
+        delete_post_meta($post_id, '_agent_seo_inline_image_polls');
+        update_post_meta($post_id, '_agent_seo_inline_image_attempts', $inline_attempts + 1);
         if ($attach_id > 0 && $this->insert_inline_image($post_id, $attach_id, $variant_index)) {
             $inline_ids[] = $attach_id;
             update_post_meta($post_id, '_agent_seo_inline_image_ids', array_values(array_unique($inline_ids)));
@@ -278,6 +316,7 @@ class Agent_SEO_Orchestrator {
         } else {
             delete_post_meta($post_id, '_agent_seo_inline_image_job');
             delete_post_meta($post_id, '_agent_seo_inline_image_attempts');
+            delete_post_meta($post_id, '_agent_seo_inline_image_polls');
             $this->check_and_progress_image_flow($post_id);
         }
     }
@@ -470,6 +509,9 @@ class Agent_SEO_Orchestrator {
         }
         if (!empty($duky_key)) {
             $attach_id = Agent_SEO_Gemini_Image::generate_and_save_image_duky($duky_key, $prompt, $post_id, $title, $keyword, $product_image, $set_thumbnail);
+            if (is_wp_error($attach_id) && $attach_id->get_error_code() === 'agent_seo_image_pending') {
+                return $attach_id;
+            }
         }
         if (!$attach_id && !empty($nvidia_key)) {
             $attach_id = Agent_SEO_Gemini_Image::generate_and_save_image_nvidia($nvidia_key, $prompt, $post_id, $title, $keyword, $set_thumbnail);
@@ -496,6 +538,7 @@ class Agent_SEO_Orchestrator {
     private function clear_image_job($post_id) {
         delete_post_meta($post_id, '_agent_seo_image_job');
         delete_post_meta($post_id, '_agent_seo_image_attempts');
+        delete_post_meta($post_id, '_agent_seo_image_polls');
         delete_post_meta($post_id, '_agent_seo_duky_media_id');
         $timestamp = wp_next_scheduled('agent_seo_image_retry_task', array($post_id));
         if ($timestamp) {
@@ -831,39 +874,11 @@ class Agent_SEO_Orchestrator {
         update_post_meta($post_id, '_agent_seo_inline_image_ids', array());
         update_post_meta($post_id, '_agent_seo_image_attempts', 0);
         if (!wp_next_scheduled('agent_seo_image_retry_task', array($post_id))) {
-            wp_schedule_single_event(time() + 15, 'agent_seo_image_retry_task', array($post_id));
+            wp_schedule_single_event(time() + 1, 'agent_seo_image_retry_task', array($post_id));
         }
-        $attach_id = $this->generate_featured_image($post_id, $image_job, 'Đang tạo ảnh đại diện' . $this->stage_progress_suffix());
-        $ai_image_success = $this->ensure_featured_image($post_id, $attach_id);
-        $image_is_set = $ai_image_success;
-        // Fallback an toàn: nếu AI/CDN lỗi nhưng sản phẩm có ảnh gốc, dùng ảnh sản phẩm
-        // để bài không bị thiếu ảnh đại diện. Ảnh AI vẫn luôn được ưu tiên khi tạo thành công.
-        if (!$image_is_set && !empty($image_job['product_image_id'])) {
-            $image_is_set = $this->ensure_featured_image($post_id, $image_job['product_image_id']);
-        }
-        if ($ai_image_success) {
-            $this->clear_image_job($post_id);
-        }
-
-        if ($ai_image_success) {
-            // Không chờ đồng bộ nữa: lên lịch ảnh phụ chạy ở request WP-Cron riêng để không
-            // giữ request chính nhiều phút, tránh bị host cắt ngang khi DukyAI vẽ chậm.
-            if (!wp_next_scheduled('agent_seo_inline_image_task', array($post_id))) {
-                wp_schedule_single_event(time() + 5, 'agent_seo_inline_image_task', array($post_id));
-            }
-        }
-
-        $inline_ids = get_post_meta($post_id, '_agent_seo_inline_image_ids', true);
-        $inline_ids = is_array($inline_ids) ? array_values(array_filter(array_map('absint', $inline_ids))) : array();
-
-        $image_warning = '';
-        if (!$image_is_set) {
-            $image_warning = 'Ảnh đại diện chưa hoàn tất. Hệ thống sẽ tự thử lại bằng DukyAI trong một request riêng.';
-            error_log('Agent SEO Warning: Không thể tạo ảnh đại diện cho bài viết ID: ' . $post_id);
-        } elseif (count($inline_ids) < 1) {
-            $image_warning = 'Ảnh phụ chưa hoàn tất. Hệ thống sẽ tự thử lại bằng DukyAI trong một request riêng.';
-            error_log('Agent SEO Warning: Chưa hoàn thiện ảnh phụ cho bài viết ID: ' . $post_id);
-        }
+        // Không gọi API ảnh đồng bộ ở đây. Bài viết được lưu ngay; featured/inline
+        // image workers tiếp tục độc lập bằng WP-Cron.
+        $image_warning = 'Bài viết đã lưu; ảnh đại diện và ảnh minh họa đang được tạo ở chế độ nền.';
 
         // 5. Tự động đi liên kết nội bộ (Internal Link)
         $this->set_stage_message('Đang tự động đi liên kết nội bộ' . $this->stage_progress_suffix() . '...');

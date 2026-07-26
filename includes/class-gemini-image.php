@@ -240,6 +240,8 @@ class Agent_SEO_Gemini_Image {
         if (!in_array($model_key, array('GEM_PIX_2', 'NARWHAL', 'R2I'), true)) {
             $model_key = 'GEM_PIX_2';
         }
+        $headers = array('Content-Type' => 'application/json', 'X-Api-Key' => $api_key);
+        $media_id = $post_id > 0 ? get_post_meta($post_id, '_agent_seo_duky_media_id', true) : '';
         $reference_override = !empty($image_url)
             ? ' PRODUCT REFERENCE IS THE PRIMARY SUBJECT: preserve the exact package shape, label layout and dominant colors from the supplied reference image; show one clearly recognizable package in the foreground occupying about 35-50% of the frame. Background packages must be secondary and consistent. Never replace the reference with generic packaging or bags of another color.'
             : ' If no product reference is supplied, do not invent packaging that is not present in the article context.';
@@ -253,7 +255,9 @@ class Agent_SEO_Gemini_Image {
             'seed' => rand(1, 2147483647)
         );
 
-        if (!empty($image_url)) {
+        // Chỉ đọc/tải ảnh tham chiếu lúc tạo task mới. Những lượt poll sau dùng
+        // mediaId đã lưu nên không cần tải lại cùng một file.
+        if (empty($media_id) && !empty($image_url)) {
             $attachment_id = attachment_url_to_postid($image_url);
             $reference_body = '';
             if ($attachment_id > 0) {
@@ -276,8 +280,6 @@ class Agent_SEO_Gemini_Image {
             }
         }
 
-        $headers = array('Content-Type' => 'application/json', 'X-Api-Key' => $api_key);
-        $media_id = $post_id > 0 ? get_post_meta($post_id, '_agent_seo_duky_media_id', true) : '';
         if (empty($media_id)) {
             $create = wp_remote_post('https://api-v1.dukyai.com/api/image-task/create', array(
                 'headers' => $headers,
@@ -300,80 +302,22 @@ class Agent_SEO_Gemini_Image {
             }
         }
 
-        // Cho phép chờ tối đa 36 lần (khoảng 3 phút) để chắc chắn AI vẽ xong và lấy được ảnh ngay trong lần chạy đầu tiên.
-        $max_attempts = 36;
-        for ($attempt = 0; $attempt < $max_attempts; $attempt++) {
-            if ($attempt > 0) {
-                sleep(5);
-            }
-            self::report_wait_progress($attempt * 5, $max_attempts * 5);
-            $check = wp_remote_post('https://api-v1.dukyai.com/api/image-task/check', array(
-                'headers' => $headers,
-                'body' => wp_json_encode(array('mediaId' => $media_id)),
-                'timeout' => 30
-            ));
-            if (is_wp_error($check)) {
-                continue;
-            }
-            $check_data = json_decode(wp_remote_retrieve_body($check), true);
-            $status = isset($check_data['status']) ? strtolower($check_data['status']) : '';
-            $image_urls = isset($check_data['imageUrls']) && is_array($check_data['imageUrls']) ? $check_data['imageUrls'] : array();
-            if (!empty($image_urls[0])) {
-                $result_url = $image_urls[0];
-                if (strpos($result_url, '/') === 0) {
-                    $result_url = 'https://api-v1.dukyai.com' . $result_url;
-                }
-                // Dùng /api/download-image proxy để bypass CORS và link GCS hết hạn.
-                for ($download_attempt = 0; $download_attempt < 3; $download_attempt++) {
-                    $download = wp_remote_post('https://api-v1.dukyai.com/api/download-image', array(
-                        'headers' => $headers,
-                        'body'    => wp_json_encode(array('imageUrl' => $result_url)),
-                        'timeout' => 60
-                    ));
-                    if (!is_wp_error($download) && wp_remote_retrieve_response_code($download) === 200) {
-                        $content_type = wp_remote_retrieve_header($download, 'content-type');
-                        $download_body = wp_remote_retrieve_body($download);
-                        // Nếu proxy trả JSON (có thể chứa encodedImage base64), xử lý riêng.
-                        if (!empty($content_type) && strpos($content_type, 'application/json') !== false) {
-                            $proxy_data = json_decode($download_body, true);
-                            if (!empty($proxy_data['encodedImage'])) {
-                                $download_body = base64_decode($proxy_data['encodedImage']);
-                            } elseif (!empty($proxy_data['error'])) {
-                                error_log('Agent SEO DukyAI download-image error: ' . $proxy_data['error']);
-                                if ($download_attempt < 2) { sleep(3); }
-                                continue;
-                            }
-                        }
-                        if (!empty($download_body) && strlen($download_body) > 1000) {
-                            $attach_id = self::sideload_base64_image(base64_encode($download_body), $post_title, $post_id, $keyword, $set_thumbnail);
-                            if ($attach_id && $post_id > 0) {
-                                delete_post_meta($post_id, '_agent_seo_duky_media_id');
-                            }
-                            if ($attach_id) {
-                                return $attach_id;
-                            }
-                        }
-                    }
-                    if ($download_attempt < 2) {
-                        sleep(3);
-                    }
-                }
-                // Fallback: thử tải trực tiếp URL GCS nếu proxy không thành công.
-                $direct_download = wp_remote_get(esc_url_raw($result_url), array('timeout' => 60, 'redirection' => 3));
-                if (!is_wp_error($direct_download) && wp_remote_retrieve_response_code($direct_download) === 200) {
-                    $download_body = wp_remote_retrieve_body($direct_download);
-                    if (!empty($download_body) && strlen($download_body) > 1000) {
-                        $attach_id = self::sideload_base64_image(base64_encode($download_body), $post_title, $post_id, $keyword, $set_thumbnail);
-                        if ($attach_id && $post_id > 0) {
-                            delete_post_meta($post_id, '_agent_seo_duky_media_id');
-                        }
-                        if ($attach_id) {
-                            return $attach_id;
-                        }
-                    }
-                }
-                continue;
-            }
+        // Mỗi cron request chỉ kiểm tra trạng thái một lần. Không sleep/poll liên tục
+        // trong cùng PHP process vì điều đó từng giữ worker đến khoảng 3 phút.
+        $check = wp_remote_post('https://api-v1.dukyai.com/api/image-task/check', array(
+            'headers' => $headers,
+            'body' => wp_json_encode(array('mediaId' => $media_id)),
+            'timeout' => 20
+        ));
+        if (is_wp_error($check)) {
+            return new WP_Error('agent_seo_image_pending', 'DukyAI chưa phản hồi; sẽ kiểm tra lại ở worker kế tiếp.');
+        }
+
+        $check_data = json_decode(wp_remote_retrieve_body($check), true);
+        $status = isset($check_data['status']) ? strtolower($check_data['status']) : '';
+        $image_urls = isset($check_data['imageUrls']) && is_array($check_data['imageUrls']) ? $check_data['imageUrls'] : array();
+
+        if (empty($image_urls[0])) {
             if (in_array($status, array('failed', 'error', 'cancelled'), true)) {
                 $error = isset($check_data['error']) ? $check_data['error'] : 'Unknown DukyAI error';
                 error_log('Agent SEO DukyAI task failed: ' . (is_string($error) ? $error : wp_json_encode($error)));
@@ -382,9 +326,56 @@ class Agent_SEO_Gemini_Image {
                 }
                 return false;
             }
+            return new WP_Error('agent_seo_image_pending', 'DukyAI đang tạo ảnh; sẽ kiểm tra lại sau.');
         }
-        error_log('Agent SEO DukyAI task timed out: ' . $media_id);
-        return false;
+
+        $result_url = $image_urls[0];
+        if (strpos($result_url, '/') === 0) {
+            $result_url = 'https://api-v1.dukyai.com' . $result_url;
+        }
+
+        // Thử proxy một lần. Nếu proxy chưa sẵn sàng thì thử URL kết quả trực tiếp;
+        // lần cron sau vẫn dùng lại mediaId, không tạo task ảnh trùng.
+        $download = wp_remote_post('https://api-v1.dukyai.com/api/download-image', array(
+            'headers' => $headers,
+            'body'    => wp_json_encode(array('imageUrl' => $result_url)),
+            'timeout' => 45
+        ));
+        if (!is_wp_error($download) && wp_remote_retrieve_response_code($download) === 200) {
+            $content_type = wp_remote_retrieve_header($download, 'content-type');
+            $download_body = wp_remote_retrieve_body($download);
+            if (!empty($content_type) && strpos($content_type, 'application/json') !== false) {
+                $proxy_data = json_decode($download_body, true);
+                if (!empty($proxy_data['encodedImage'])) {
+                    $download_body = base64_decode($proxy_data['encodedImage']);
+                }
+            }
+            if (!empty($download_body) && strlen($download_body) > 1000) {
+                $attach_id = self::sideload_base64_image(base64_encode($download_body), $post_title, $post_id, $keyword, $set_thumbnail);
+                if ($attach_id) {
+                    if ($post_id > 0) {
+                        delete_post_meta($post_id, '_agent_seo_duky_media_id');
+                    }
+                    return $attach_id;
+                }
+            }
+        }
+
+        $direct_download = wp_remote_get(esc_url_raw($result_url), array('timeout' => 45, 'redirection' => 3));
+        if (!is_wp_error($direct_download) && wp_remote_retrieve_response_code($direct_download) === 200) {
+            $download_body = wp_remote_retrieve_body($direct_download);
+            if (!empty($download_body) && strlen($download_body) > 1000) {
+                $attach_id = self::sideload_base64_image(base64_encode($download_body), $post_title, $post_id, $keyword, $set_thumbnail);
+                if ($attach_id) {
+                    if ($post_id > 0) {
+                        delete_post_meta($post_id, '_agent_seo_duky_media_id');
+                    }
+                    return $attach_id;
+                }
+            }
+        }
+
+        return new WP_Error('agent_seo_image_pending', 'Ảnh đã tạo nhưng tệp chưa tải được; sẽ thử lại.');
     }
 
     /**
