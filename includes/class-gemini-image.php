@@ -178,7 +178,9 @@ class Agent_SEO_Gemini_Image {
     }
 
     /**
-     * Validate DukyAI credentials by creating a lightweight asynchronous task.
+     * Validate DukyAI credentials with both CREATE and CHECK. A successful
+     * create alone is not enough because an invalid model/account can still
+     * fail as soon as the task worker starts processing it.
      */
     public static function test_connection_duky($api_key, $model_key = 'GEM_PIX_2') {
         if (empty($api_key)) {
@@ -199,15 +201,86 @@ class Agent_SEO_Gemini_Image {
             'timeout' => 30
         ));
         if (is_wp_error($response)) {
-            return array('success' => false, 'message' => $response->get_error_message());
+            self::record_duky_diagnostic('create', $response->get_error_message());
+            return array('success' => false, 'message' => 'CREATE không kết nối được: ' . $response->get_error_message());
         }
         $code = wp_remote_retrieve_response_code($response);
-        $data = json_decode(wp_remote_retrieve_body($response), true);
-        if ($code === 200 && !empty($data['ok']) && !empty($data['mediaId'])) {
-            return array('success' => true);
+        $raw_body = wp_remote_retrieve_body($response);
+        $data = json_decode($raw_body, true);
+        $media_id = isset($data['mediaId']) ? sanitize_text_field($data['mediaId']) : '';
+        if ($code < 200 || $code >= 300 || empty($media_id)) {
+            $message = self::extract_duky_error($data, $raw_body, 'HTTP ' . $code);
+            self::record_duky_diagnostic('create', $message, $code);
+            return array('success' => false, 'message' => 'CREATE lỗi (HTTP ' . $code . '): ' . $message);
         }
-        $message = isset($data['error']) ? $data['error'] : 'HTTP ' . $code;
-        return array('success' => false, 'message' => is_string($message) ? $message : wp_json_encode($message));
+
+        $check = wp_remote_post('https://api-v1.dukyai.com/api/image-task/check', array(
+            'headers' => array(
+                'Content-Type' => 'application/json',
+                'X-Api-Key' => $api_key
+            ),
+            'body' => wp_json_encode(array('mediaId' => $media_id)),
+            'timeout' => 30
+        ));
+        if (is_wp_error($check)) {
+            self::record_duky_diagnostic('check', $check->get_error_message());
+            return array('success' => false, 'message' => 'CREATE thành công nhưng CHECK không kết nối được: ' . $check->get_error_message());
+        }
+
+        $check_code = wp_remote_retrieve_response_code($check);
+        $check_raw = wp_remote_retrieve_body($check);
+        $check_data = json_decode($check_raw, true);
+        if ($check_code < 200 || $check_code >= 300 || !is_array($check_data)) {
+            $message = self::extract_duky_error($check_data, $check_raw, 'HTTP ' . $check_code);
+            self::record_duky_diagnostic('check', $message, $check_code);
+            return array('success' => false, 'message' => 'CREATE thành công nhưng CHECK lỗi (HTTP ' . $check_code . '): ' . $message);
+        }
+
+        $status = isset($check_data['status']) ? sanitize_text_field($check_data['status']) : 'đang xử lý';
+        if (in_array(strtolower($status), array('failed', 'error', 'cancelled'), true)) {
+            $message = self::extract_duky_error($check_data, $check_raw, 'Task bị từ chối');
+            self::record_duky_diagnostic('task', $message, $check_code);
+            return array('success' => false, 'message' => 'Task DukyAI thất bại: ' . $message);
+        }
+
+        self::clear_duky_diagnostic();
+        return array(
+            'success' => true,
+            'message' => 'CREATE và CHECK đều hoạt động; trạng thái task thử nghiệm: ' . $status . '.'
+        );
+    }
+
+    private static function extract_duky_error($data, $raw_body, $fallback) {
+        if (is_array($data)) {
+            foreach (array('error', 'message', 'detail') as $field) {
+                if (!empty($data[$field])) {
+                    return is_string($data[$field])
+                        ? sanitize_text_field($data[$field])
+                        : sanitize_text_field(wp_json_encode($data[$field]));
+                }
+            }
+        }
+        $raw_body = sanitize_text_field(wp_strip_all_tags((string) $raw_body));
+        return $raw_body !== '' ? mb_substr($raw_body, 0, 500) : $fallback;
+    }
+
+    private static function record_duky_diagnostic($stage, $message, $http_code = 0) {
+        $diagnostic = array(
+            'stage' => sanitize_key($stage),
+            'message' => sanitize_text_field((string) $message),
+            'http_code' => intval($http_code),
+            'time' => time()
+        );
+        update_option('aseo_last_duky_error', $diagnostic, false);
+        error_log(
+            'Agent SEO DukyAI ' . $diagnostic['stage']
+            . ($diagnostic['http_code'] ? ' HTTP ' . $diagnostic['http_code'] : '')
+            . ': ' . $diagnostic['message']
+        );
+    }
+
+    private static function clear_duky_diagnostic() {
+        delete_option('aseo_last_duky_error');
     }
 
     /**
@@ -231,12 +304,13 @@ class Agent_SEO_Gemini_Image {
      * Create a DukyAI ImageFX task, poll it, download the result and attach it
      * to the correct WordPress post.
      */
-    public static function generate_and_save_image_duky($api_key, $prompt, $post_id = 0, $post_title = '', $keyword = '', $image_url = '', $set_thumbnail = true) {
+    public static function generate_and_save_image_duky($api_key, $prompt, $post_id = 0, $post_title = '', $keyword = '', $image_url = '', $set_thumbnail = true, $model_key_override = '') {
         if (empty($api_key)) {
+            self::record_duky_diagnostic('config', 'Chưa cấu hình DukyAI API Key.');
             return false;
         }
 
-        $model_key = get_option('aseo_duky_model', 'GEM_PIX_2');
+        $model_key = !empty($model_key_override) ? $model_key_override : get_option('aseo_duky_model', 'GEM_PIX_2');
         if (!in_array($model_key, array('GEM_PIX_2', 'NARWHAL', 'R2I'), true)) {
             $model_key = 'GEM_PIX_2';
         }
@@ -287,14 +361,19 @@ class Agent_SEO_Gemini_Image {
                 'timeout' => 45
             ));
             if (is_wp_error($create)) {
-                error_log('Agent SEO DukyAI create error: ' . $create->get_error_message());
+                self::record_duky_diagnostic('create', $create->get_error_message());
                 return false;
             }
             $create_code = wp_remote_retrieve_response_code($create);
-            $create_data = json_decode(wp_remote_retrieve_body($create), true);
+            $create_body = wp_remote_retrieve_body($create);
+            $create_data = json_decode($create_body, true);
             $media_id = isset($create_data['mediaId']) ? sanitize_text_field($create_data['mediaId']) : '';
-            if ($create_code !== 200 || empty($media_id)) {
-                error_log('Agent SEO DukyAI create error (HTTP ' . $create_code . '): ' . wp_remote_retrieve_body($create));
+            if ($create_code < 200 || $create_code >= 300 || empty($media_id)) {
+                self::record_duky_diagnostic(
+                    'create',
+                    self::extract_duky_error($create_data, $create_body, 'Không nhận được mediaId.'),
+                    $create_code
+                );
                 return false;
             }
             if ($post_id > 0) {
@@ -310,17 +389,42 @@ class Agent_SEO_Gemini_Image {
             'timeout' => 20
         ));
         if (is_wp_error($check)) {
+            self::record_duky_diagnostic('check', $check->get_error_message());
             return new WP_Error('agent_seo_image_pending', 'DukyAI chưa phản hồi; sẽ kiểm tra lại ở worker kế tiếp.');
         }
 
-        $check_data = json_decode(wp_remote_retrieve_body($check), true);
+        $check_code = wp_remote_retrieve_response_code($check);
+        $check_body = wp_remote_retrieve_body($check);
+        if ($check_code < 200 || $check_code >= 300) {
+            // Lỗi xác thực/request sẽ không tự hết khi poll lại cùng mediaId.
+            // 408, 429 và 5xx là lỗi tạm thời nên vẫn giữ task để thử sau.
+            if ($check_code >= 400 && $check_code < 500 && !in_array($check_code, array(408, 429), true)) {
+                self::record_duky_diagnostic(
+                    'check',
+                    self::extract_duky_error(json_decode($check_body, true), $check_body, 'Request kiểm tra bị từ chối.'),
+                    $check_code
+                );
+                if ($post_id > 0) {
+                    delete_post_meta($post_id, '_agent_seo_duky_media_id');
+                }
+                return false;
+            }
+            self::record_duky_diagnostic('check', 'Lỗi tạm thời khi kiểm tra task.', $check_code);
+            return new WP_Error('agent_seo_image_pending', 'DukyAI tạm thời chưa phản hồi hợp lệ; sẽ kiểm tra lại.');
+        }
+
+        $check_data = json_decode($check_body, true);
+        if (!is_array($check_data)) {
+            self::record_duky_diagnostic('check', 'Phản hồi không phải JSON hợp lệ.', $check_code);
+            return new WP_Error('agent_seo_image_pending', 'DukyAI trả dữ liệu chưa hoàn chỉnh; sẽ kiểm tra lại.');
+        }
         $status = isset($check_data['status']) ? strtolower($check_data['status']) : '';
         $image_urls = isset($check_data['imageUrls']) && is_array($check_data['imageUrls']) ? $check_data['imageUrls'] : array();
 
         if (empty($image_urls[0])) {
             if (in_array($status, array('failed', 'error', 'cancelled'), true)) {
-                $error = isset($check_data['error']) ? $check_data['error'] : 'Unknown DukyAI error';
-                error_log('Agent SEO DukyAI task failed: ' . (is_string($error) ? $error : wp_json_encode($error)));
+                $error = self::extract_duky_error($check_data, $check_body, 'DukyAI báo task thất bại.');
+                self::record_duky_diagnostic('task', $error, $check_code);
                 if ($post_id > 0) {
                     delete_post_meta($post_id, '_agent_seo_duky_media_id');
                 }
@@ -356,6 +460,7 @@ class Agent_SEO_Gemini_Image {
                     if ($post_id > 0) {
                         delete_post_meta($post_id, '_agent_seo_duky_media_id');
                     }
+                    self::clear_duky_diagnostic();
                     return $attach_id;
                 }
             }
@@ -370,11 +475,13 @@ class Agent_SEO_Gemini_Image {
                     if ($post_id > 0) {
                         delete_post_meta($post_id, '_agent_seo_duky_media_id');
                     }
+                    self::clear_duky_diagnostic();
                     return $attach_id;
                 }
             }
         }
 
+        self::record_duky_diagnostic('download', 'Task đã có ảnh nhưng WordPress chưa tải hoặc lưu được tệp ảnh.');
         return new WP_Error('agent_seo_image_pending', 'Ảnh đã tạo nhưng tệp chưa tải được; sẽ thử lại.');
     }
 
@@ -433,7 +540,7 @@ class Agent_SEO_Gemini_Image {
     /**
      * Gửi yêu cầu sinh ảnh đến máy chủ tự động hóa Google Flow
      */
-    public static function generate_and_save_image_kaggle($kaggle_url, $prompt, $post_id = 0, $post_title = '', $keyword = '', $image_url = '') {
+    public static function generate_and_save_image_kaggle($kaggle_url, $prompt, $post_id = 0, $post_title = '', $keyword = '', $image_url = '', $set_thumbnail = true) {
         if (empty($image_url)) {
             error_log('Agent SEO Image Google Flow Error: Missing product reference image URL. Select a WooCommerce product with a featured image.');
             return false;
@@ -470,7 +577,7 @@ class Agent_SEO_Gemini_Image {
         }
 
         // Thực hiện lưu trữ file ảnh vào WordPress
-        return self::sideload_base64_image($base64_data, $post_title, $post_id, $keyword);
+        return self::sideload_base64_image($base64_data, $post_title, $post_id, $keyword, $set_thumbnail);
     }
 
     /**

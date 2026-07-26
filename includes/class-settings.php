@@ -17,6 +17,114 @@ class Agent_SEO_Settings {
         add_action('wp_ajax_agent_seo_save_product', array($this, 'ajax_save_product'));
         add_action('wp_ajax_agent_seo_autosave_setting', array($this, 'ajax_autosave_setting'));
         add_action('wp_ajax_agent_seo_retry_image', array($this, 'ajax_retry_image'));
+        add_action('wp_ajax_agent_seo_stop_batch', array($this, 'ajax_stop_batch'));
+        add_action('wp_ajax_agent_seo_parse_brief', array($this, 'ajax_parse_brief'));
+        add_action('wp_ajax_agent_seo_prepare_assistant', array($this, 'ajax_prepare_assistant'));
+    }
+
+    public function ajax_prepare_assistant() {
+        if (!current_user_can('manage_options')) {
+            wp_send_json_error(array('message' => 'Không có quyền truy cập.'), 403);
+        }
+        check_ajax_referer('agent_seo_prepare_assistant', 'nonce');
+        $brief = isset($_POST['brief']) ? sanitize_textarea_field(wp_unslash($_POST['brief'])) : '';
+        $api_key = get_option('aseo_gemini_api_key', '');
+        if ($brief === '' || $api_key === '') {
+            wp_send_json_error(array('message' => $brief === '' ? 'Hãy nhập yêu cầu trước.' : 'Chưa cấu hình Gemini API Key.'));
+        }
+        $parsed = Agent_SEO_Gemini_Text::parse_article_brief($api_key, $brief);
+        if (empty($parsed['success'])) {
+            wp_send_json_error(array('message' => $parsed['message']));
+        }
+        $niche = get_option('aseo_niche', 'Lĩnh vực kinh doanh của website');
+        $brand_name = get_option('aseo_brand_name', '');
+        $product_info = get_option('aseo_brand_price', '');
+        $product_id = absint(get_option('aseo_target_product', 0));
+        if ($product_id && function_exists('wc_get_product')) {
+            $product = wc_get_product($product_id);
+            if ($product) $product_info = trim($product->get_name() . ' | ' . $product_info);
+        }
+        $prompt_result = Agent_SEO_Gemini_Text::generate_master_prompt_suggestions($api_key, $niche, $brand_name, $product_info, $brief);
+        if (empty($prompt_result['success'])) {
+            wp_send_json_error(array('message' => $prompt_result['message']));
+        }
+        update_option('aseo_master_prompt_brief', $brief);
+        update_option('aseo_master_prompt', $prompt_result['master_prompt']);
+        update_option('aseo_master_text_prompt', $prompt_result['master_prompt']);
+        update_option('aseo_master_image_prompt', $prompt_result['master_prompt']);
+        wp_send_json_success(array('brief' => $parsed['brief'], 'master_prompt' => $prompt_result['master_prompt']));
+    }
+
+    public function ajax_parse_brief() {
+        if (!current_user_can('manage_options')) {
+            wp_send_json_error(array('message' => 'Không có quyền truy cập.'), 403);
+        }
+        check_ajax_referer('agent_seo_parse_brief', 'nonce');
+        $brief = isset($_POST['brief']) ? sanitize_textarea_field(wp_unslash($_POST['brief'])) : '';
+        if ($brief === '') {
+            wp_send_json_error(array('message' => 'Hãy mô tả yêu cầu trước.'));
+        }
+        $api_key = get_option('aseo_gemini_api_key', '');
+        if ($api_key === '') {
+            wp_send_json_error(array('message' => 'Chưa cấu hình Gemini API Key.'));
+        }
+        $result = Agent_SEO_Gemini_Text::parse_article_brief($api_key, $brief);
+        if (empty($result['success'])) {
+            wp_send_json_error(array('message' => isset($result['message']) ? $result['message'] : 'AI không thể phân tích brief.'));
+        }
+        wp_send_json_success($result['brief']);
+    }
+
+    /**
+     * Dừng batch hiện tại và hủy các cron còn đang chờ.
+     * Request HTTP đang chạy không thể bị kill an toàn, nhưng worker sẽ đọc trạng
+     * thái stopped và thoát ngay khi request hiện tại trả về.
+     */
+    public function ajax_stop_batch() {
+        if (!current_user_can('manage_options')) {
+            wp_send_json_error(array('message' => 'Không có quyền truy cập.'), 403);
+        }
+        check_ajax_referer('agent_seo_stop_batch', 'nonce');
+
+        $batch = get_option('aseo_batch_status', array());
+        $active_states = array('queued', 'running', 'waiting', 'images_pending');
+        $status = is_array($batch) && isset($batch['status']) ? $batch['status'] : 'idle';
+        if (!in_array($status, $active_states, true)) {
+            wp_send_json_error(array('message' => 'Không có tiến trình nào đang chạy.'), 400);
+        }
+
+        $batch['status'] = 'stopped';
+        $batch['stop_requested'] = 1;
+        $batch['message'] = 'Đã dừng theo yêu cầu. Bài và ảnh hoàn tất trước thời điểm dừng vẫn được giữ lại.';
+        $batch['updated_at'] = time();
+        $batch['finished_at'] = time();
+        update_option('aseo_batch_status', $batch, false);
+
+        // Không tạo thêm bài mới trong batch này.
+        wp_clear_scheduled_hook('agent_seo_background_task');
+
+        $post_ids = isset($batch['post_ids']) && is_array($batch['post_ids']) ? $batch['post_ids'] : array();
+        if (!empty($batch['pending_images']) && is_array($batch['pending_images'])) {
+            $post_ids = array_merge($post_ids, $batch['pending_images']);
+        }
+        if (!empty($batch['pending_inline_images']) && is_array($batch['pending_inline_images'])) {
+            $post_ids = array_merge($post_ids, $batch['pending_inline_images']);
+        }
+        if (!empty($batch['last_post_id'])) {
+            $post_ids[] = $batch['last_post_id'];
+        }
+        $post_ids = array_values(array_unique(array_filter(array_map('absint', $post_ids))));
+        foreach ($post_ids as $post_id) {
+            wp_clear_scheduled_hook('agent_seo_image_retry_task', array($post_id));
+            wp_clear_scheduled_hook('agent_seo_inline_image_task', array($post_id));
+        }
+
+        $total = max(0, intval(isset($batch['total']) ? $batch['total'] : 0));
+        $completed = max(0, min($total, intval(isset($batch['completed']) ? $batch['completed'] : 0)));
+        $batch['total'] = $total;
+        $batch['completed'] = $completed;
+        $batch['percent'] = $total > 0 ? intval(round(($completed / $total) * 100)) : 0;
+        wp_send_json_success($batch);
     }
 
     public function ajax_save_product() {
@@ -43,7 +151,8 @@ class Agent_SEO_Settings {
             'aseo_brand_cta' => 'text', 'aseo_gsc_property' => 'text', 'aseo_gsc_sitemap_url' => 'url',
             'aseo_reference_image_id' => 'int', 'aseo_gemini_api_key' => 'text',
             'aseo_nvidia_api_key' => 'text', 'aseo_duky_api_key' => 'text',
-            'aseo_duky_model' => 'text', 'aseo_image_engine' => 'text',
+            'aseo_duky_model' => 'text', 'aseo_kaggle_api_url' => 'url', 'aseo_image_engine' => 'text',
+            'aseo_enable_inline_images' => 'text',
             'aseo_indexnow_key' => 'text', 'aseo_gsc_client_id' => 'text',
             'aseo_gsc_client_secret' => 'text', 'aseo_source_website' => 'url',
             'aseo_master_text_prompt' => 'textarea', 'aseo_master_image_prompt' => 'textarea',
@@ -114,14 +223,21 @@ class Agent_SEO_Settings {
         // Các bài cũ có thể chưa có job ảnh minh họa; dùng cùng ngữ cảnh để
         // worker bổ sung tối đa 2 ảnh vào thân bài sau khi ảnh đại diện xong.
         $inline_job = get_post_meta($post_id, '_agent_seo_inline_image_job', true);
-        if (!is_array($inline_job) || empty($inline_job['prompt'])) {
+        if (get_option('aseo_enable_inline_images', '0') === '1' && (!is_array($inline_job) || empty($inline_job['prompt']))) {
             update_post_meta($post_id, '_agent_seo_inline_image_job', $job);
+        } elseif (get_option('aseo_enable_inline_images', '0') !== '1') {
+            delete_post_meta($post_id, '_agent_seo_inline_image_job');
         }
         $inline_ids = get_post_meta($post_id, '_agent_seo_inline_image_ids', true);
         if (!is_array($inline_ids)) {
             update_post_meta($post_id, '_agent_seo_inline_image_ids', array());
         }
         update_post_meta($post_id, '_agent_seo_force_image_retry', '1');
+        if (get_post_thumbnail_id($post_id)) {
+            // Người dùng đã yêu cầu tạo lại: xóa thumbnail hiện tại để worker
+            // không bỏ qua và không hiển thị ảnh tham chiếu như kết quả AI.
+            delete_post_thumbnail($post_id);
+        }
         delete_post_meta($post_id, '_agent_seo_duky_media_id');
         delete_post_meta($post_id, '_agent_seo_image_attempts');
 
@@ -141,7 +257,7 @@ class Agent_SEO_Settings {
                 'sslverify' => false
             ));
         }
-        if (!wp_next_scheduled('agent_seo_inline_image_task', array($post_id))) {
+        if (get_option('aseo_enable_inline_images', '0') === '1' && !wp_next_scheduled('agent_seo_inline_image_task', array($post_id))) {
             // Chờ ảnh đại diện được tạo trước rồi mới chèn ảnh minh họa.
             wp_schedule_single_event(time() + 90, 'agent_seo_inline_image_task', array($post_id));
         }
@@ -160,11 +276,6 @@ class Agent_SEO_Settings {
         }
         // Tự cứu một batch đã xếp hàng nhưng WP-Cron chưa được website kích hoạt.
         if (isset($batch['status']) && in_array($batch['status'], array('queued', 'waiting'), true)) {
-            if ($batch['status'] === 'queued' && get_transient('agent_seo_generation_lock')) {
-                // Một worker thật sẽ đổi trạng thái sang running ngay sau khi khóa.
-                // Nếu vẫn queued thì đây là khóa sót lại do request cũ bị timeout.
-                delete_transient('agent_seo_generation_lock');
-            }
             $last_kick = intval(isset($batch['last_kick_at']) ? $batch['last_kick_at'] : 0);
             $updated_at = intval(isset($batch['updated_at']) ? $batch['updated_at'] : 0);
             if (time() - max($last_kick, $updated_at) >= 15) {
@@ -182,34 +293,103 @@ class Agent_SEO_Settings {
                 }
             }
         }
-        if (isset($batch['status']) && $batch['status'] === 'images_pending') {
+        if (isset($batch['status']) && in_array($batch['status'], array('running', 'waiting', 'images_pending'), true)) {
             $last_inline_kick = intval(isset($batch['last_inline_kick_at']) ? $batch['last_inline_kick_at'] : 0);
             if (time() - $last_inline_kick >= 15) {
-                $kicked = false;
+                // Tự khôi phục danh sách từ post_ids. Trước đây nếu event ảnh đã
+                // tồn tại nhưng quá hạn thì $kicked=false và Cron không được đánh
+                // thức, khiến job nằm chờ vô thời hạn.
+                $image_post_ids = isset($batch['post_ids']) && is_array($batch['post_ids'])
+                    ? $batch['post_ids']
+                    : array();
                 if (!empty($batch['pending_images']) && is_array($batch['pending_images'])) {
-                    foreach ($batch['pending_images'] as $pending_post_id) {
-                        $pending_post_id = absint($pending_post_id);
-                        if ($pending_post_id > 0 && !wp_next_scheduled('agent_seo_image_retry_task', array($pending_post_id))) {
-                            wp_schedule_single_event(time(), 'agent_seo_image_retry_task', array($pending_post_id));
-                            $kicked = true;
-                        }
-                    }
+                    $image_post_ids = array_merge($image_post_ids, $batch['pending_images']);
                 }
                 if (!empty($batch['pending_inline_images']) && is_array($batch['pending_inline_images'])) {
-                    foreach ($batch['pending_inline_images'] as $pending_post_id) {
-                        $pending_post_id = absint($pending_post_id);
-                        if ($pending_post_id > 0 && !wp_next_scheduled('agent_seo_inline_image_task', array($pending_post_id))) {
+                    $image_post_ids = array_merge($image_post_ids, $batch['pending_inline_images']);
+                }
+                if (!empty($batch['last_post_id'])) {
+                    $image_post_ids[] = $batch['last_post_id'];
+                }
+                $image_post_ids = array_values(array_unique(array_filter(array_map('absint', $image_post_ids))));
+                $has_outstanding_image_job = false;
+                $missing_images_without_job = array();
+                // Dựng lại từ trạng thái thật của từng bài, không giữ ID cũ đã
+                // hoàn tất vì chúng có thể làm batch mắc kẹt ở images_pending.
+                $pending_featured = array();
+                $pending_inline = array();
+
+                foreach ($image_post_ids as $pending_post_id) {
+                    if (!get_post($pending_post_id)) {
+                        continue;
+                    }
+                    $featured_job = get_post_meta($pending_post_id, '_agent_seo_image_job', true);
+                    if (
+                        !get_post_thumbnail_id($pending_post_id)
+                        && is_array($featured_job)
+                        && !empty($featured_job['prompt'])
+                    ) {
+                        $pending_featured[] = $pending_post_id;
+                        $has_outstanding_image_job = true;
+                        if (!wp_next_scheduled('agent_seo_image_retry_task', array($pending_post_id))) {
+                            wp_schedule_single_event(time(), 'agent_seo_image_retry_task', array($pending_post_id));
+                        }
+                    } elseif (!get_post_thumbnail_id($pending_post_id)) {
+                        $missing_images_without_job[] = $pending_post_id;
+                    }
+
+                    $inline_job = get_post_meta($pending_post_id, '_agent_seo_inline_image_job', true);
+                    $inline_ids = get_post_meta($pending_post_id, '_agent_seo_inline_image_ids', true);
+                    $inline_ids = is_array($inline_ids)
+                        ? array_values(array_filter(array_map('absint', $inline_ids)))
+                        : array();
+                    if (
+                        get_option('aseo_enable_inline_images', '0') === '1'
+                        && count($inline_ids) < 1
+                        && is_array($inline_job)
+                        && !empty($inline_job['prompt'])
+                    ) {
+                        $pending_inline[] = $pending_post_id;
+                        $has_outstanding_image_job = true;
+                        if (!wp_next_scheduled('agent_seo_inline_image_task', array($pending_post_id))) {
                             wp_schedule_single_event(time(), 'agent_seo_inline_image_task', array($pending_post_id));
-                            $kicked = true;
                         }
                     }
                 }
-                if ($kicked) {
-                    $batch['last_inline_kick_at'] = time();
+
+                $batch['pending_images'] = array_values(array_unique(array_filter(array_map('absint', $pending_featured))));
+                $batch['pending_inline_images'] = array_values(array_unique(array_filter(array_map('absint', $pending_inline))));
+                $batch['last_inline_kick_at'] = time();
+                if ($has_outstanding_image_job) {
                     update_option('aseo_batch_status', $batch, false);
+                    // Luôn đánh thức Cron, kể cả event đã tồn tại. Đây là khác
+                    // biệt quan trọng giúp xử lý các event đang bị quá hạn.
                     if (function_exists('spawn_cron')) {
                         spawn_cron(time());
                     }
+                    if (defined('DISABLE_WP_CRON') && DISABLE_WP_CRON) {
+                        wp_remote_post(site_url('/wp-cron.php'), array(
+                            'timeout' => 0.01,
+                            'blocking' => false,
+                            'sslverify' => false
+                        ));
+                    }
+                } else {
+                    // Không còn job nào để chạy: kết thúc trạng thái chờ thay vì
+                    // hiển thị quay vô hạn, đồng thời báo rõ bài nào thiếu ảnh.
+                    if ($batch['status'] === 'images_pending') {
+                        $errors = isset($batch['image_errors']) && is_array($batch['image_errors'])
+                            ? $batch['image_errors']
+                            : array();
+                        $errors = array_merge($errors, $missing_images_without_job);
+                        $batch['image_errors'] = array_values(array_unique(array_filter(array_map('absint', $errors))));
+                        $batch['status'] = 'complete';
+                        $batch['finished_at'] = time();
+                        $batch['message'] = !empty($batch['image_errors'])
+                            ? 'Đã tạo xong bài viết; có ' . count($batch['image_errors']) . ' bài chưa tạo được ảnh. Có thể bấm “Tạo lại ảnh AI” để thử lại.'
+                            : 'Đã tạo xong toàn bộ bài viết và hình ảnh.';
+                    }
+                    update_option('aseo_batch_status', $batch, false);
                 }
             }
         }
@@ -277,6 +457,7 @@ class Agent_SEO_Settings {
         register_setting('agent_seo_settings_group', 'aseo_gsc_sitemap_url');
         register_setting('agent_seo_settings_group', 'aseo_source_website');
         register_setting('agent_seo_settings_group', 'aseo_image_engine');
+        register_setting('agent_seo_settings_group', 'aseo_enable_inline_images');
         register_setting('agent_seo_settings_group', 'aseo_niche');
         register_setting('agent_seo_settings_group', 'aseo_brand_voice');
         register_setting('agent_seo_settings_group', 'aseo_keywords');
@@ -329,13 +510,10 @@ class Agent_SEO_Settings {
                 $duky_model = get_option('aseo_duky_model', 'GEM_PIX_2');
             }
 
-            if (empty($api_key)) {
-                add_settings_error('agent_seo_messages', 'empty_key', 'Vui lòng điền Gemini API Key để kiểm tra.', 'error');
-                return;
-            }
-
             // Gọi thử kết nối Text API
-            $test_text = Agent_SEO_Gemini_Text::test_connection($api_key);
+            $test_text = empty($api_key)
+                ? array('success' => false, 'message' => 'Chưa nhập Gemini API Key.')
+                : Agent_SEO_Gemini_Text::test_connection($api_key);
             
             $kaggle_url = isset($_POST['aseo_kaggle_api_url_temp']) ? sanitize_text_field($_POST['aseo_kaggle_api_url_temp']) : '';
             if (empty($kaggle_url)) {
@@ -374,7 +552,8 @@ class Agent_SEO_Settings {
                 add_settings_error(
                     'agent_seo_messages',
                     'test_success',
-                    'Kết nối thành công! Cả API Văn bản (Gemini 3.1 Flash Lite) và API Hình ảnh (' . $image_engine . ') đều hoạt động tốt.',
+                    'Kết nối thành công! API Văn bản (Gemini 3.1 Flash Lite) và API Hình ảnh (' . $image_engine . ') đều hoạt động. '
+                        . (!empty($test_image['message']) ? esc_html($test_image['message']) : ''),
                     'updated'
                 );
             } else {
@@ -392,11 +571,36 @@ class Agent_SEO_Settings {
         if ($action === 'force_run') {
             $num_posts = isset($_POST['aseo_num_posts']) ? intval($_POST['aseo_num_posts']) : 1;
             $num_posts = max(1, min(10, $num_posts)); // Giới hạn tối đa 10 bài mỗi lượt để tránh quá tải
+            $existing_batch = get_option('aseo_batch_status', array());
+            $active_states = array('queued', 'running', 'waiting', 'images_pending');
+            $existing_status = is_array($existing_batch) && isset($existing_batch['status'])
+                ? $existing_batch['status']
+                : '';
+            $atomic_lock = get_option('aseo_generation_lock', array());
+            $atomic_lock_time = is_array($atomic_lock) && isset($atomic_lock['created_at'])
+                ? intval($atomic_lock['created_at'])
+                : 0;
+            $worker_locked = ($atomic_lock_time > 0 && (time() - $atomic_lock_time) <= 900)
+                || (bool) get_transient('agent_seo_generation_lock');
+            if (in_array($existing_status, $active_states, true) || $worker_locked) {
+                add_settings_error(
+                    'agent_seo_messages',
+                    'batch_already_running',
+                    'Một tiến trình tạo bài vẫn đang chạy. Vui lòng bấm “Dừng tạo bài”, chờ worker dừng hẳn rồi mới bắt đầu lượt mới.',
+                    'error'
+                );
+                return;
+            }
             if (isset($_POST['aseo_primary_keyword_run'])) {
                 $submitted_primary_keyword = sanitize_text_field(wp_unslash($_POST['aseo_primary_keyword_run']));
                 if ($submitted_primary_keyword !== '') {
                     update_option('aseo_primary_keyword', $submitted_primary_keyword);
                 }
+            }
+            // Chatbot brief có thể cung cấp keyword cho lượt chạy đầu tiên,
+            // không bắt người dùng phải mở tab cấu hình nâng cao.
+            if (trim(get_option('aseo_primary_keyword', '')) === '' && !empty($_POST['aseo_article_topic_run'])) {
+                update_option('aseo_primary_keyword', sanitize_text_field(wp_unslash($_POST['aseo_article_topic_run'])));
             }
             if (trim(get_option('aseo_primary_keyword', '')) === '') {
                 add_settings_error('agent_seo_messages', 'missing_primary_keyword', 'Vui lòng nhập và lưu từ khóa chính cố định trước khi tạo bài.', 'error');
@@ -408,16 +612,43 @@ class Agent_SEO_Settings {
             } else {
                 $selected_product_id = absint(get_option('aseo_target_product', ''));
             }
-            // Các lượt bấm tạo bài đều tự động xuất bản sau khi hoàn tất.
-            $post_status = 'publish';
-            update_option('aseo_post_status', 'publish');
+            // Brief theo từng lượt tạo: giữ cấu hình website toàn cục, nhưng cho phép
+            // người dùng thay đổi chủ đề/khu vực/ý định/backlink mà không phải sửa tab SEO.
+            $run_topic = isset($_POST['aseo_article_topic_run'])
+                ? sanitize_text_field(wp_unslash($_POST['aseo_article_topic_run'])) : '';
+            $run_location = isset($_POST['aseo_article_location_run'])
+                ? sanitize_text_field(wp_unslash($_POST['aseo_article_location_run'])) : '';
+            $run_intent = isset($_POST['aseo_article_intent_run'])
+                ? sanitize_text_field(wp_unslash($_POST['aseo_article_intent_run'])) : '';
+            $run_reference = isset($_POST['aseo_article_reference_run'])
+                ? esc_url_raw(wp_unslash($_POST['aseo_article_reference_run'])) : '';
+            $run_instructions = isset($_POST['aseo_article_instructions_run'])
+                ? sanitize_textarea_field(wp_unslash($_POST['aseo_article_instructions_run'])) : '';
+            $run_title = isset($_POST['aseo_article_title_run'])
+                ? sanitize_text_field(wp_unslash($_POST['aseo_article_title_run'])) : '';
+            $run_outline = isset($_POST['aseo_article_outline_run'])
+                ? sanitize_textarea_field(wp_unslash($_POST['aseo_article_outline_run'])) : '';
+            $run_secondary = isset($_POST['aseo_article_secondary_run'])
+                ? sanitize_textarea_field(wp_unslash($_POST['aseo_article_secondary_run'])) : '';
+            $run_brief = array_filter(array(
+                $run_title !== '' ? 'Tiêu đề ưu tiên (nếu phù hợp): ' . $run_title : '',
+                $run_location !== '' ? 'Khu vực mục tiêu: ' . $run_location : '',
+                $run_intent !== '' ? 'Mục đích tìm kiếm: ' . $run_intent : '',
+                $run_reference !== '' ? 'Liên kết bắt buộc cần chèn tự nhiên: ' . $run_reference : '',
+                $run_secondary !== '' ? 'Từ khóa liên quan cần phủ: ' . $run_secondary : '',
+                $run_outline !== '' ? "Dàn ý đã được người dùng duyệt:\n" . $run_outline : '',
+                $run_instructions !== '' ? 'Yêu cầu riêng của người dùng: ' . $run_instructions : ''
+            ));
+            // Mặc định lưu nháp để người dùng duyệt brief/nội dung trước khi xuất bản.
+            $post_status = isset($_POST['aseo_post_status_run']) && sanitize_key($_POST['aseo_post_status_run']) === 'publish'
+                ? 'publish' : 'draft';
+            update_option('aseo_post_status', $post_status);
 
             // Chỉ xếp bài đầu tiên. Worker sẽ tự xếp bài kế tiếp sau khi bài hiện tại hoàn tất,
             // tránh nhiều request Gemini/Google Flow chạy chồng lên nhau.
             // Remove stale/duplicate workers from an earlier click before
             // starting this exact batch, otherwise counts can be added together.
             wp_clear_scheduled_hook('agent_seo_background_task');
-            delete_transient('agent_seo_generation_lock');
             update_option('aseo_batch_status', array(
                 'status' => 'queued',
                 'total' => $num_posts,
@@ -426,6 +657,11 @@ class Agent_SEO_Settings {
                 'remaining' => $num_posts,
                 'requested_status' => $post_status,
                 'product_id' => $selected_product_id,
+                'run_topic' => $run_topic,
+                'run_brief' => implode("\n", $run_brief),
+                'run_brief_used' => 0,
+                'post_ids' => array(),
+                'stop_requested' => 0,
                 'message' => 'Đã xếp hàng ' . $num_posts . ' bài. Đang chờ worker bắt đầu...',
                 'started_at' => time(),
                 'updated_at' => time(),
@@ -517,6 +753,7 @@ class Agent_SEO_Settings {
         $nvidia_api_key = get_option('aseo_nvidia_api_key', '');
         $kaggle_api_url = get_option('aseo_kaggle_api_url', '');
         $duky_api_key = get_option('aseo_duky_api_key', '');
+        $last_duky_error = get_option('aseo_last_duky_error', array());
         $indexnow_key = get_option('aseo_indexnow_key', '');
         $gsc_client_id = get_option('aseo_gsc_client_id', '');
         $gsc_client_secret = get_option('aseo_gsc_client_secret', '');
@@ -529,9 +766,7 @@ class Agent_SEO_Settings {
             $duky_model = 'GEM_PIX_2';
         }
         $image_engine = get_option('aseo_image_engine', 'duky');
-        if (in_array($image_engine, array('nvidia', 'kaggle'), true)) {
-            $image_engine = 'duky';
-        }
+        $enable_inline_images = get_option('aseo_enable_inline_images', '0') === '1';
         $niche = get_option('aseo_niche', 'Sản phẩm, dịch vụ và lĩnh vực kinh doanh của website');
         $brand_voice = get_option('aseo_brand_voice', 'Chuyên nghiệp, tin cậy, rõ ràng và phù hợp với khách hàng mục tiêu');
         $keywords = get_option('aseo_keywords', '');
@@ -688,6 +923,59 @@ class Agent_SEO_Settings {
             .aseo-create-form select { width:100%; min-height:46px; border:1px solid #cbd5e1; border-radius:9px; padding:0 12px; background:#fff; color:#17251d; font-size:.88rem; }
             .aseo-product-run-select { max-width: none; }
             .aseo-create-form .aseo-btn-run { min-height:46px; padding:0 24px; white-space:nowrap; }
+            .aseo-wizard-intro { display:flex; align-items:center; gap:10px; margin:0 0 18px; color:#365347; font-size:.82rem; }
+            .aseo-wizard-intro .aseo-wizard-badge { display:inline-flex; align-items:center; justify-content:center; min-width:26px; height:26px; border-radius:50%; background:#0a1f14; color:#e7c969; font-weight:800; }
+            .aseo-brief-grid { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:14px; margin-bottom:14px; }
+            .aseo-create-form > .aseo-brief-grid { grid-column:1 / -1; }
+            .aseo-brief-grid .aseo-create-control { display:flex; flex-direction:column; gap:6px; }
+            .aseo-brief-grid .aseo-create-control-wide { grid-column:1 / -1; }
+            .aseo-brief-grid input, .aseo-brief-grid select, .aseo-brief-grid textarea { width:100%; min-height:46px; border:1px solid #b9cfc1; border-radius:9px; padding:10px 12px; background:#fff; color:#17251d; font-size:.88rem; }
+            .aseo-brief-grid textarea { min-height:70px; resize:vertical; }
+            .aseo-brief-grid label span { font-size:.78rem; font-weight:800; color:#365347; }
+            .aseo-outline-preview { display:none; margin:14px 0; padding:14px 16px; border:1px solid #cfe3d6; border-radius:10px; background:#fbfefc; }
+            .aseo-outline-preview.is-visible { display:block; }
+            .aseo-outline-preview strong { color:#0a1f14; }
+            .aseo-outline-preview ul { margin:8px 0 0 18px; color:#52665a; }
+            .aseo-outline-preview .aseo-create-control { display:flex; flex-direction:column; gap:6px; margin-top:12px; }
+            .aseo-outline-preview .aseo-create-control span { font-size:.78rem; font-weight:800; color:#365347; }
+            .aseo-outline-preview input, .aseo-outline-preview textarea { width:100%; border:1px solid #b9cfc1; border-radius:9px; padding:10px 12px; background:#fff; color:#17251d; font-size:.88rem; }
+            .aseo-brief-chat { order:1; padding:22px 24px; border-bottom:1px solid #e7eee9; background:linear-gradient(135deg,#f5fbf7,#fffdf5); }
+            .aseo-brief-chat-head { display:flex; align-items:center; gap:10px; margin-bottom:10px; }
+            .aseo-brief-chat-head h3 { margin:0; color:#0a1f14; font-size:1.08rem; }
+            .aseo-brief-chat-head span { color:#64748b; font-size:.78rem; }
+            .aseo-brief-chat textarea { width:100%; min-height:82px; resize:vertical; border:1.5px solid #b9cfc1; border-radius:12px; padding:12px 14px; font-size:.9rem; line-height:1.5; }
+            .aseo-brief-chat-actions { display:flex; align-items:center; gap:10px; margin-top:10px; flex-wrap:wrap; }
+            .aseo-brief-chat-status { color:#64748b; font-size:.78rem; }
+            .aseo-article-prompt-preview { margin-top:12px; padding:12px 14px; border:1px solid #cfe3d6; border-radius:10px; background:#fbfefc; color:#365347; font-size:.8rem; line-height:1.5; }
+            .aseo-article-prompt-preview strong { color:#0a1f14; display:block; margin-bottom:5px; }
+            .aseo-article-prompt-preview code { display:block; max-height:150px; overflow:auto; white-space:pre-wrap; font-family:inherit; color:#52665a; }
+            /* Sản phẩm/ảnh là đầu vào thủ công, đặt trước chatbot và chỉ hiển thị một lần. */
+            #aseo-panel-seo { display:block !important; }
+            #aseo-panel-seo > .aseo-section:not(#aseo-product-section) { display:none !important; }
+            .aseo-create-form .aseo-create-control:has(.aseo-product-run-select) { display:none !important; }
+            .aseo-create-form { grid-template-columns:1fr !important; align-items:stretch; gap:14px; }
+            .aseo-create-form > .aseo-create-control { max-width:260px; }
+            .aseo-create-form > .aseo-brief-grid { width:100%; }
+            .aseo-create-form .aseo-wizard-actions { width:100%; justify-content:flex-end; }
+            .aseo-create-form .aseo-wizard-actions .aseo-create-control { max-width:220px; }
+            .aseo-create-form .aseo-wizard-actions .aseo-btn { min-height:50px; }
+            /* Chế độ gọn: ưu tiên nhãn và thao tác, không chiếm màn hình bằng mô tả dài. */
+            .aseo-workflow-card .desc,
+            .aseo-workflow-card .aseo-guide,
+            .aseo-workflow-card .aseo-wizard-intro,
+            .aseo-workflow-card .aseo-master-presets,
+            .aseo-workflow-card .aseo-advanced-hint { display:none !important; }
+            .aseo-workflow-card .aseo-section-header p { display:none; }
+            .aseo-workflow-card .aseo-section-header { padding-top:13px; padding-bottom:13px; }
+            .aseo-workflow-card .aseo-section-body { padding-top:15px; padding-bottom:15px; }
+            .aseo-workflow-card .aseo-chat-bubble { padding:8px 11px; }
+            .aseo-workflow-card .aseo-chat-log { gap:12px; margin-bottom:14px; min-height:360px; max-height:520px; padding:14px 12px; }
+            .aseo-workflow-card .aseo-chat-message { max-width:92%; }
+            .aseo-workflow-card .aseo-chat-builder .aseo-master-brief { min-height:140px; }
+            .aseo-workflow-card .aseo-chat-builder { padding:24px; }
+            .aseo-wizard-actions { display:flex; align-items:center; gap:10px; flex-wrap:wrap; }
+            .aseo-wizard-next { background:#eaf8ef; color:#166534; border:1px solid #9bc7aa; }
+            .aseo-wizard-next:hover { background:#dcfce7; color:#166534; }
             .aseo-publish-inline { color:#16834b; font-size:.76rem; font-weight:700; white-space:nowrap; padding-top:2px; }
             .aseo-product-main { border-color: #cfe3d6; }
             .aseo-product-main-row { display:flex; align-items:flex-start; gap:24px; min-height:230px; }
@@ -985,11 +1273,17 @@ class Agent_SEO_Settings {
             .aseo-progress-card.complete .aseo-spinner:after { content:'✓'; display:block; color:#16a34a; font-size:20px; line-height:20px; }
             .aseo-progress-card.failed { background:#fff7f7; border-color:#fecaca; }
             .aseo-progress-card.failed .aseo-spinner { animation:none; border-color:#dc2626; }
+            .aseo-progress-card.stopped { background:#fffaf0; border-color:#f6c76f; }
+            .aseo-progress-card.stopped .aseo-spinner { animation:none; border-color:#d97706; border-top-color:#d97706; }
             .aseo-progress-meta { display:flex; align-items:center; gap:10px; }
             .aseo-progress-timer { display:inline-flex; align-items:center; gap:5px; font-weight:700; font-size:0.8rem; color:#334155; background:#e2eef0; border:1px solid #cbd5e1; padding:3px 10px; border-radius:8px; white-space:nowrap; }
             .aseo-progress-card.complete .aseo-progress-timer { background:#dcfce7; border-color:#86efac; color:#166534; }
             .aseo-progress-card.failed .aseo-progress-timer { background:#fee2e2; border-color:#fca5a5; color:#991b1b; }
+            .aseo-progress-card.stopped .aseo-progress-timer { background:#fef3c7; border-color:#f6c76f; color:#92400e; }
             .aseo-progress-count { font-weight:800; color:#1a5c3a; white-space:nowrap; }
+            .aseo-stop-batch { border:1px solid #dc2626; border-radius:8px; padding:5px 10px; background:#fff; color:#b91c1c; font-weight:700; cursor:pointer; }
+            .aseo-stop-batch:hover { background:#fef2f2; }
+            .aseo-stop-batch:disabled { opacity:.55; cursor:wait; }
             .aseo-progress-track { height:10px; overflow:hidden; border-radius:999px; background:#e5eee8; }
             .aseo-progress-fill { width:0; height:100%; border-radius:inherit; background:linear-gradient(90deg,#16834b,#49b675); transition:width .45s ease; }
             .aseo-progress-message { margin:10px 0 0; color:#64748b; font-size:.84rem; }
@@ -1011,6 +1305,8 @@ class Agent_SEO_Settings {
                 .aseo-quick-head { flex-direction:column; gap:8px; }
                 .aseo-create-form { grid-template-columns: 1fr; }
                 .aseo-create-form .aseo-btn { width: 100%; }
+                .aseo-brief-grid { grid-template-columns:1fr; }
+                .aseo-brief-grid .aseo-create-control-wide { grid-column:auto; }
             }
 
             /* ========== DASHICON STYLING ========== */
@@ -1055,10 +1351,10 @@ class Agent_SEO_Settings {
             .aseo-stat-card { min-height:86px; border-radius:14px; background:linear-gradient(180deg,#fff,#f8faf9); }
             .aseo-stat-card:hover { transform:none; box-shadow:0 8px 20px rgba(10,31,20,.07); }
             .aseo-quick-create { border:0; box-shadow:0 10px 26px rgba(10,31,20,.09); background:linear-gradient(135deg,#f5fbf7,#fffdf5); padding:24px; }
-            /* Luồng tạo bài chính nằm ở khu vực Hành động nhanh bên dưới. */
-            .aseo-quick-create { display:none; }
-            .aseo-guide-step[href="#aseo-create-section"] { display:none; }
-            .aseo-guide { grid-template-columns:repeat(2,1fr); }
+            /* Luồng tạo bài chính luôn nằm ở đầu trang, trước phần cấu hình. */
+            .aseo-quick-create { display:block; }
+            .aseo-guide-step[href="#aseo-create-section"] { display:flex; }
+            .aseo-guide { grid-template-columns:repeat(3,1fr); }
             .aseo-quick-create h3 { font-size:1.18rem; }
             .aseo-quick-create p { font-size:.86rem; }
             .aseo-create-form select, .aseo-create-form .aseo-btn-run { min-height:50px; }
@@ -1073,7 +1369,56 @@ class Agent_SEO_Settings {
             .aseo-field input, .aseo-field textarea, .aseo-field select { border-radius:9px; border-color:#cbd8cf; }
             .aseo-field input:focus, .aseo-field textarea:focus, .aseo-field select:focus { border-color:#16834b; box-shadow:0 0 0 2px rgba(22,131,75,.13); }
             .aseo-progress-card { box-shadow:0 5px 16px rgba(10,31,20,.06); }
-            #aseo-settings-form > div[style*="margin-top"] .aseo-btn-save { display:none; }
+            /* Bản tạo bài ở cuối trang là bản cũ; chỉ giữ một CTA chính ở đầu. */
+            .aseo-action-bar .aseo-run-form { display:none; }
+            #aseo-settings-form > div[style*="margin-top"] .aseo-btn-save { display:inline-flex; }
+            #aseo-panel-api .aseo-master-section { display:block; border:2px solid #cfe3d6; box-shadow:0 8px 24px rgba(10,31,20,.08); }
+            #aseo-panel-api .aseo-master-section .aseo-section-header { background:linear-gradient(135deg,#eef9f1,#fffdf5); }
+            /* Chatbot brief đầu trang là luồng duy nhất; khối prompt cũ chỉ giữ dữ liệu nền. */
+            #aseo-panel-api .aseo-master-section { display:none !important; }
+            /* Sắp xếp luồng chính như một wizard: brief → tiến trình → cấu hình chi tiết. */
+            .aseo-main { display:flex; flex-direction:column; padding:0; background:transparent; border:0; border-radius:0; box-shadow:none; }
+            .aseo-header { border-radius:20px 20px 0 0; }
+            .aseo-workflow-card { display:flex; flex-direction:column; overflow:hidden; background:#fff; border:1px solid #dbe7df; border-top:0; border-radius:0 0 20px 20px; box-shadow:0 12px 34px rgba(10,31,20,.08); }
+            #aseo-settings-form { display:contents; }
+            #aseo-panel-seo { order:1; }
+            .aseo-brief-chat { order:2; }
+            #aseo-create-section { order:3; }
+            .aseo-guide { order:4; }
+            .aseo-progress-card { order:5; }
+            .aseo-stats { order:6; }
+            .aseo-own-notices-box { order:7; }
+            #aseo-panel-api { order:8; }
+            .aseo-tabs { order:9; }
+            #aseo-panel-brand { order:10; }
+            #aseo-settings-form > div[style*="margin-top"] { order:11; }
+            .aseo-action-bar { order:12; }
+            .aseo-posts-list { order:13; }
+            .aseo-workflow-card > .aseo-stats { margin:0; padding:22px 24px; border-bottom:1px solid #e7eee9; }
+            .aseo-workflow-card > .aseo-own-notices-box { padding:0 24px; }
+            .aseo-workflow-card .aseo-progress-card,
+            .aseo-workflow-card .aseo-quick-create,
+            .aseo-workflow-card .aseo-section,
+            .aseo-workflow-card .aseo-action-bar,
+            .aseo-workflow-card .aseo-posts-list { border-radius:0; box-shadow:none; border-left:0; border-right:0; }
+            .aseo-workflow-card .aseo-progress-card { margin:0; padding:22px 24px; border-top:0; border-bottom:1px solid #e7eee9; background:#fbfefc; }
+            .aseo-workflow-card .aseo-quick-create { margin:0; padding:24px; border-bottom:1px solid #e7eee9; background:linear-gradient(135deg,#f5fbf7,#fffdf5); }
+            .aseo-workflow-card .aseo-guide { margin:0; padding:16px 24px; border-bottom:1px solid #e7eee9; background:#f8faf9; }
+            .aseo-workflow-card .aseo-tabs { margin:0; border-radius:0; border-bottom:1px solid #dbe7df; background:#f4f7f5; }
+            .aseo-workflow-card .aseo-section { border-bottom:1px solid #e7eee9; }
+            .aseo-workflow-card .aseo-action-bar { margin:0; border-top:0; border-bottom:1px solid #e7eee9; }
+            .aseo-workflow-card .aseo-posts-list { margin:0; }
+            #aseo-panel-api .aseo-master-section { margin:0 0 22px; }
+            #aseo-panel-api .aseo-master-section .aseo-section-header { padding:20px 24px; }
+            #aseo-panel-api .aseo-master-section .aseo-section-header h3 { font-size:1.05rem; }
+            #aseo-panel-api .aseo-chat-builder { max-width:none; padding:24px; background:#fff; }
+            #aseo-panel-api .aseo-chat-log { min-height:360px; max-height:520px; overflow-y:auto; padding:14px 12px; margin-bottom:18px; scrollbar-width:thin; }
+            #aseo-panel-api .aseo-chat-bubble { box-shadow:0 2px 7px rgba(10,31,20,.05); }
+            #aseo-panel-api .aseo-master-brief { min-height:140px; background:#fbfefc; }
+            #aseo-panel-api .aseo-master-presets { padding-top:2px; }
+            #aseo-panel-api .aseo-master-actions { display:flex; align-items:center; flex-wrap:wrap; gap:10px; margin-top:16px; padding-top:14px; border-top:1px solid #eef2ef; }
+            #aseo-panel-api .aseo-master-actions .aseo-btn { min-height:44px; }
+            @media (max-width: 900px) { .aseo-guide { grid-template-columns:1fr; } }
             @media (prefers-reduced-motion: reduce) { .aseo-wrap *, .aseo-wrap *::before, .aseo-wrap *::after { animation-duration:.001ms !important; transition-duration:.001ms !important; } }
         </style>
 
@@ -1091,6 +1436,13 @@ class Agent_SEO_Settings {
             </div>
 
             <div class="aseo-main">
+                <div class="aseo-workflow-card">
+                <div class="aseo-brief-chat" id="aseo-brief-chat">
+                    <div class="aseo-brief-chat-head"><span aria-hidden="true">🤖</span><h3>Trợ lý tạo bài</h3><span>Viết yêu cầu tự nhiên, AI tự điền brief</span></div>
+                    <textarea id="aseo-brief-chat-input" placeholder="Ví dụ: Viết bài giới thiệu gạo ST25 25kg của Gạo Cần Thơ Kavico, bán tại Cần Thơ, chèn link https://gaocantho.com/..."></textarea>
+                    <div class="aseo-brief-chat-actions"><button type="button" class="aseo-btn aseo-btn-save" id="aseo-brief-chat-submit">✨ AI chuẩn bị brief & prompt</button><button type="submit" form="aseo-settings-form" class="aseo-btn aseo-btn-test">💾 Lưu cấu hình</button><span class="aseo-brief-chat-status" id="aseo-brief-chat-status" aria-live="polite"></span></div>
+                    <?php if (!empty($master_prompt)) : ?><div class="aseo-article-prompt-preview" id="aseo-article-prompt-preview"><strong>Prompt đang áp dụng</strong><code><?php echo esc_html($master_prompt); ?></code></div><?php endif; ?>
+                </div>
                 <!-- ===== STATS CARDS ===== -->
                 <div class="aseo-stats">
                     <div class="aseo-stat-card">
@@ -1152,13 +1504,14 @@ class Agent_SEO_Settings {
                 $batch_state = isset($batch_status['status']) ? $batch_status['status'] : 'idle';
                 $batch_percent = $batch_total > 0 ? intval(round(($batch_completed / $batch_total) * 100)) : 0;
                 if ($batch_state === 'images_pending') $batch_percent = 95;
-                $batch_visible = in_array($batch_state, array('queued', 'running', 'waiting', 'images_pending', 'complete', 'failed'), true);
+                $batch_active = in_array($batch_state, array('queued', 'running', 'waiting', 'images_pending'), true);
+                $batch_visible = in_array($batch_state, array('queued', 'running', 'waiting', 'images_pending', 'complete', 'failed', 'stopped'), true);
                 
                 $batch_started_at = intval(isset($batch_status['started_at']) ? $batch_status['started_at'] : 0);
                 $batch_finished_at = intval(isset($batch_status['finished_at']) ? $batch_status['finished_at'] : 0);
                 $initial_elapsed = 0;
                 if ($batch_started_at > 0) {
-                    if (in_array($batch_state, array('complete', 'failed'), true) && $batch_finished_at > 0) {
+                    if (in_array($batch_state, array('complete', 'failed', 'stopped'), true) && $batch_finished_at > 0) {
                         $initial_elapsed = max(0, $batch_finished_at - $batch_started_at);
                     } else {
                         $initial_elapsed = max(0, time() - $batch_started_at);
@@ -1168,42 +1521,49 @@ class Agent_SEO_Settings {
                 ?>
                 <div id="aseo-progress-card" class="aseo-progress-card <?php echo $batch_visible ? 'visible ' . esc_attr($batch_state) : ''; ?>" data-started="<?php echo esc_attr($batch_started_at); ?>" data-finished="<?php echo esc_attr($batch_finished_at); ?>">
                     <div class="aseo-progress-head">
-                        <div class="aseo-progress-title"><span class="aseo-spinner"></span><span id="aseo-progress-label"><?php echo $batch_state === 'complete' ? 'Hoàn tất tạo bài' : 'AI đang xử lý bài viết'; ?></span></div>
+                        <div class="aseo-progress-title"><span class="aseo-spinner"></span><span id="aseo-progress-label"><?php echo $batch_state === 'complete' ? 'Hoàn tất tạo bài' : ($batch_state === 'stopped' ? 'Đã dừng tiến trình' : 'AI đang xử lý bài viết'); ?></span></div>
                         <div class="aseo-progress-meta">
                             <span id="aseo-progress-timer" class="aseo-progress-timer" title="Thời gian thực hiện">⏱️ <?php echo esc_html($initial_timer_str); ?></span>
                             <div id="aseo-progress-count" class="aseo-progress-count"><?php echo esc_html($batch_completed . '/' . $batch_total . ' bài'); ?></div>
+                            <button type="button" id="aseo-stop-batch" class="aseo-stop-batch" style="<?php echo $batch_active ? '' : 'display:none;'; ?>">■ Dừng tiến trình</button>
                         </div>
                     </div>
                     <div class="aseo-progress-track"><div id="aseo-progress-fill" class="aseo-progress-fill" style="width:<?php echo esc_attr($batch_percent); ?>%;"></div></div>
                     <p id="aseo-progress-message" class="aseo-progress-message"><?php echo esc_html(isset($batch_status['message']) ? $batch_status['message'] : ''); ?></p>
                 </div>
 
-                <div class="aseo-guide" aria-label="Hướng dẫn tạo bài">
-                    <a class="aseo-guide-step" href="#aseo-product-section">
-                        <b class="aseo-guide-number">1</b><span><strong>Chọn sản phẩm & ảnh</strong><span>Chọn sản phẩm ở trên; ảnh Media là tùy chọn.</span></span>
-                    </a>
-                    <a class="aseo-guide-step" href="#aseo-seo-section">
-                        <b class="aseo-guide-number">2</b><span><strong>Nhập từ khóa</strong><span>Nhập 1 từ khóa chính và tối đa 3 từ khóa phụ.</span></span>
-                    </a>
-                    <a class="aseo-guide-step" href="#aseo-create-section">
-                        <b class="aseo-guide-number">3</b><span><strong>Bấm tạo bài</strong><span>AI tự viết, tạo ảnh và xuất bản theo cấu hình.</span></span>
-                    </a>
-                </div>
-
                 <div class="aseo-quick-create" id="aseo-create-section">
                     <div class="aseo-quick-head">
                         <div>
-                            <h3>⚡ Tạo bài viết mới</h3>
-                            <p>Chọn sản phẩm và số lượng, AI sẽ tự viết, tạo ảnh và xuất bản.</p>
+                            <h3>⚡ Tạo bài viết theo brief</h3>
+                            <p>Nhập brief → duyệt dàn ý → tạo bài.</p>
                         </div>
-                        <span class="aseo-publish-inline">✓ Tự động xuất bản</span>
+                        <span class="aseo-publish-inline">Bước 1/3 · Brief</span>
                     </div>
+                        <div class="aseo-wizard-intro"><span class="aseo-wizard-badge">1</span><span>Brief lượt này</span></div>
                     <form method="post" action="" class="aseo-create-form" onsubmit="return confirm('Bắt đầu tạo bài viết bằng AI?');">
                         <?php wp_nonce_field('aseo_action_nonce', 'aseo_nonce'); ?>
                         <input type="hidden" name="aseo_action" value="force_run">
                         <input type="hidden" class="aseo-primary-keyword-run" name="aseo_primary_keyword_run" value="">
+                        <input type="hidden" name="aseo_article_topic_run" id="aseo_article_topic_run" value="">
+                        <input type="hidden" name="aseo_article_location_run" id="aseo_article_location_run" value="">
+                        <input type="hidden" name="aseo_article_intent_run" id="aseo_article_intent_run" value="">
+                        <input type="hidden" name="aseo_article_reference_run" id="aseo_article_reference_run" value="">
+                        <input type="hidden" name="aseo_article_instructions_run" id="aseo_article_instructions_run" value="">
+                        <input type="hidden" name="aseo_article_title_run" id="aseo_article_title_run" value="">
+                        <input type="hidden" name="aseo_article_outline_run" id="aseo_article_outline_run" value="">
+                        <input type="hidden" name="aseo_article_secondary_run" id="aseo_article_secondary_run" value="">
+                        <div class="aseo-brief-grid aseo-create-control-wide">
+                            <label class="aseo-create-control"><span>Chủ đề / keyword *</span><input type="text" id="aseo_article_topic" placeholder="gạo ST25 25kg Cần Thơ" required></label>
+                            <label class="aseo-create-control"><span>Khu vực</span><input type="text" id="aseo_article_location" placeholder="Cần Thơ, miền Tây"></label>
+                            <label class="aseo-create-control"><span>Ý định</span><select id="aseo_article_intent"><option value="Tìm hiểu thông tin">Tìm hiểu</option><option value="So sánh và lựa chọn">So sánh</option><option value="Tìm nơi mua / nhận báo giá">Mua / báo giá</option><option value="Hướng dẫn sử dụng">Hướng dẫn</option></select></label>
+                            <label class="aseo-create-control"><span>Backlink</span><input type="url" id="aseo_article_reference" placeholder="https://gaocantho.com/"></label>
+                            <label class="aseo-create-control aseo-create-control-wide"><span>Từ khóa phụ</span><input type="text" id="aseo_article_secondary" placeholder="giá gạo ST25, đại lý gạo Cần Thơ"></label>
+                            <label class="aseo-create-control aseo-create-control-wide"><span>Yêu cầu thêm</span><textarea id="aseo_article_instructions" placeholder="Thông tin bắt buộc hoặc điều cần tránh"></textarea></label>
+                        </div>
+                        <div id="aseo-outline-preview" class="aseo-outline-preview" aria-live="polite"></div>
                         <?php if (!empty($wc_products)) : ?>
-                            <label class="aseo-create-control"><span>Sản phẩm tham chiếu</span>
+                            <label class="aseo-create-control"><span>Sản phẩm</span>
                                 <select id="aseo_target_product_run" name="aseo_target_product_run" class="aseo-product-run-select">
                                     <option value="">Viết bài chung</option>
                                     <?php foreach ($wc_products as $id => $title) : ?>
@@ -1214,20 +1574,23 @@ class Agent_SEO_Settings {
                         <?php else : ?>
                             <label class="aseo-create-control"><span>Sản phẩm tham chiếu</span><select disabled><option>Viết bài chung</option></select></label>
                         <?php endif; ?>
-                        <label class="aseo-create-control"><span>Số bài</span>
-                            <select name="aseo_num_posts"><option value="1">1 bài</option><option value="2">2 bài</option><option value="3">3 bài</option></select>
+                            <label class="aseo-create-control"><span>Số bài</span>
+                            <select name="aseo_num_posts"><option value="1">1 bài</option><option value="2">2 bài</option><option value="3">3 bài</option><option value="5">5 bài</option><option value="10">10 bài</option></select>
                         </label>
-                        <button type="submit" class="aseo-btn aseo-btn-run">Tạo bài ngay <span aria-hidden="true">→</span></button>
-                        <input type="hidden" name="aseo_post_status" value="publish">
+                        <div class="aseo-wizard-actions"><button type="button" id="aseo-preview-brief" class="aseo-btn aseo-wizard-next">2. Xem dàn ý</button><label class="aseo-create-control"><span>Kết quả sau khi viết</span><select name="aseo_post_status_run"><option value="draft" selected>Lưu bản nháp để duyệt</option><option value="publish">Xuất bản ngay</option></select></label><button type="submit" class="aseo-btn aseo-btn-run">3. Duyệt & tạo bài <span aria-hidden="true">→</span></button></div>
                     </form>
                 </div>
 
-                <!-- ===== TAB NAVIGATION ===== -->
-                <div class="aseo-advanced-hint">Bạn chỉ cần dùng 3 bước trên. Các mục bên dưới là thiết lập nâng cao, có thể để mặc định nếu chưa quen.</div>
-                <div class="aseo-tabs">
-                    <button type="button" class="aseo-tab-btn active" data-tab="aseo-panel-seo"><span class="tab-icon">✍️</span> Nội dung & từ khóa</button>
-                    <button type="button" class="aseo-tab-btn" data-tab="aseo-panel-brand"><span class="tab-icon">🏢</span> Thông tin doanh nghiệp</button>
-                    <button type="button" id="aseo-api-toggle" class="aseo-api-toggle" aria-expanded="false">⚙ Cài đặt kỹ thuật</button>
+                <div class="aseo-guide" aria-label="Hướng dẫn tạo bài">
+                    <a class="aseo-guide-step" href="#aseo-create-section">
+                        <b class="aseo-guide-number">1</b><span><strong>Nhập brief</strong><span>Chủ đề, khu vực, ý định và backlink.</span></span>
+                    </a>
+                    <a class="aseo-guide-step" href="#aseo-outline-preview">
+                        <b class="aseo-guide-number">2</b><span><strong>Duyệt dàn ý</strong><span>Xem hướng triển khai trước khi AI viết.</span></span>
+                    </a>
+                    <a class="aseo-guide-step" href="#aseo-progress-card">
+                        <b class="aseo-guide-number">3</b><span><strong>Tạo & kiểm tra</strong><span>Bài được lưu nháp, ảnh chạy nền.</span></span>
+                    </a>
                 </div>
 
                 <!-- ===== FORM ===== -->
@@ -1263,10 +1626,16 @@ class Agent_SEO_Settings {
                                         <label><span class="field-icon">⚙️</span> Bộ máy sinh ảnh</label>
                                         <p class="desc">Chọn công nghệ để tự động sinh ảnh đại diện cho mỗi bài viết.</p>
                                         <select id="aseo_image_engine" name="aseo_image_engine">
-                                            <option value="duky" <?php selected($image_engine, 'duky'); ?>>DukyAI ImageFX (Khuyên dùng)</option>
+                                            <option value="kaggle" <?php selected($image_engine, 'kaggle'); ?>>Google Flow (Playwright API)</option>
+                                            <option value="duky" <?php selected($image_engine, 'duky'); ?>>DukyAI ImageFX</option>
                                             <option value="nvidia" <?php selected($image_engine, 'nvidia'); ?>>NVIDIA FLUX.2 (Chất lượng cao)</option>
                                             <option value="imagen" <?php selected($image_engine, 'imagen'); ?>>Gemini Imagen 4 (Trả phí)</option>
                                         </select>
+                                    </div>
+                                    <div class="aseo-field aseo-fg-full">
+                                        <label><span class="field-icon">🌐</span> Google Flow API URL</label>
+                                        <p class="desc">Dán URL public tới Flask server, ví dụ https://ten-mien.trycloudflare.com/generate</p>
+                                        <input type="url" id="aseo_kaggle_api_url" name="aseo_kaggle_api_url" value="<?php echo esc_attr($kaggle_api_url); ?>" placeholder="https://...trycloudflare.com/generate">
                                     </div>
                                     <div class="aseo-field">
                                         <label><span class="field-icon">🔑</span> DukyAI API Key</label>
@@ -1281,6 +1650,24 @@ class Agent_SEO_Settings {
                                             <option value="NARWHAL" <?php selected($duky_model, 'NARWHAL'); ?>>NARWHAL — Nano Banana 2</option>
                                             <option value="R2I" <?php selected($duky_model, 'R2I'); ?>>R2I — Imagen 4</option>
                                         </select>
+                                    </div>
+                                    <?php if (is_array($last_duky_error) && !empty($last_duky_error['message'])) : ?>
+                                    <div class="aseo-field aseo-fg-full" style="border:1px solid #fecaca;background:#fff7f7;padding:12px 14px;border-radius:10px;">
+                                        <strong style="color:#b91c1c;">Lỗi DukyAI gần nhất:</strong>
+                                        <span><?php echo esc_html(
+                                            strtoupper(isset($last_duky_error['stage']) ? $last_duky_error['stage'] : 'API')
+                                            . (!empty($last_duky_error['http_code']) ? ' / HTTP ' . intval($last_duky_error['http_code']) : '')
+                                            . ' — ' . $last_duky_error['message']
+                                        ); ?></span>
+                                    </div>
+                                    <?php endif; ?>
+                                    <div class="aseo-field aseo-fg-full">
+                                        <label><span class="field-icon">📝</span> Ảnh minh họa trong nội dung</label>
+                                        <p class="desc">Tắt để bài hoàn tất nhanh hơn; ảnh đại diện vẫn được tạo bình thường.</p>
+                                        <label style="display:flex; align-items:center; gap:8px; font-weight:600;">
+                                            <input type="checkbox" id="aseo_enable_inline_images" name="aseo_enable_inline_images" value="1" <?php checked($enable_inline_images, true); ?>>
+                                            Tạo thêm 1 ảnh minh họa trong thân bài
+                                        </label>
                                     </div>
                                     <div class="aseo-field aseo-fg-full">
                                         <label><span class="field-icon">🔐</span> NVIDIA NIM API Key</label>
@@ -1320,7 +1707,7 @@ class Agent_SEO_Settings {
                         <div class="aseo-section aseo-master-section">
                             <div class="aseo-section-header">
                                 <span class="sec-icon">🧩</span>
-                                <h3>AI thiết lập phong cách</h3>
+                                <h3>🤖 Trợ lý AI — thiết lập bài viết & hình ảnh</h3>
                                 <?php if (!empty($master_prompt)) : ?><span class="aseo-prompt-ready">✓ Đã thiết lập</span><?php endif; ?>
                             </div>
                             <div class="aseo-section-body">
@@ -1385,6 +1772,14 @@ class Agent_SEO_Settings {
 
                     </div>
 
+                    <!-- ===== TAB NAVIGATION ===== -->
+                    <div class="aseo-advanced-hint">Sau khi thiết lập chatbot, bạn có thể tinh chỉnh nội dung, thông tin doanh nghiệp và cài đặt kỹ thuật ở các tab bên dưới.</div>
+                    <div class="aseo-tabs">
+                        <button type="button" class="aseo-tab-btn" data-tab="aseo-panel-seo"><span class="tab-icon">⚙️</span> Cấu hình nâng cao</button>
+                        <button type="button" class="aseo-tab-btn" data-tab="aseo-panel-brand"><span class="tab-icon">🏢</span> Thông tin doanh nghiệp</button>
+                        <button type="button" id="aseo-api-toggle" class="aseo-api-toggle" aria-expanded="false">⚙ Cài đặt kỹ thuật</button>
+                    </div>
+
                     <!-- PANEL 2: BRAND -->
                     <div id="aseo-panel-brand" class="aseo-tab-panel">
 
@@ -1427,7 +1822,7 @@ class Agent_SEO_Settings {
                     </div>
 
                     <!-- PANEL 3: SEO -->
-                    <div id="aseo-panel-seo" class="aseo-tab-panel active">
+                    <div id="aseo-panel-seo" class="aseo-tab-panel">
                         <div class="aseo-section aseo-product-main" id="aseo-product-section">
                             <div class="aseo-section-header">
                                 <span class="sec-icon">🛒</span>
@@ -1587,28 +1982,11 @@ class Agent_SEO_Settings {
                         <input type="hidden" id="aseo_nvidia_api_key_temp" name="aseo_nvidia_api_key_temp" value="">
                         <input type="hidden" id="aseo_duky_api_key_temp" name="aseo_duky_api_key_temp" value="">
                         <input type="hidden" id="aseo_duky_model_temp" name="aseo_duky_model_temp" value="">
+                        <input type="hidden" id="aseo_kaggle_api_url_temp" name="aseo_kaggle_api_url_temp" value="">
                         <input type="hidden" id="aseo_image_engine_temp" name="aseo_image_engine_temp" value="">
-                        <button type="submit" class="aseo-btn aseo-btn-test" onclick="document.getElementById('aseo_gemini_api_key_temp').value=document.getElementById('aseo_gemini_api_key').value;document.getElementById('aseo_nvidia_api_key_temp').value=document.getElementById('aseo_nvidia_api_key').value;document.getElementById('aseo_duky_api_key_temp').value=document.getElementById('aseo_duky_api_key').value;document.getElementById('aseo_duky_model_temp').value=document.getElementById('aseo_duky_model').value;document.getElementById('aseo_image_engine_temp').value=document.getElementById('aseo_image_engine').value;">
+                        <button type="submit" class="aseo-btn aseo-btn-test" onclick="document.getElementById('aseo_gemini_api_key_temp').value=document.getElementById('aseo_gemini_api_key').value;document.getElementById('aseo_nvidia_api_key_temp').value=document.getElementById('aseo_nvidia_api_key').value;document.getElementById('aseo_duky_api_key_temp').value=document.getElementById('aseo_duky_api_key').value;document.getElementById('aseo_duky_model_temp').value=document.getElementById('aseo_duky_model').value;document.getElementById('aseo_kaggle_api_url_temp').value=document.getElementById('aseo_kaggle_api_url').value;document.getElementById('aseo_image_engine_temp').value=document.getElementById('aseo_image_engine').value;">
                             🔌 Kiểm tra kết nối
                         </button>
-                    </form>
-
-                    <!-- Force Run -->
-                    <form method="post" action="" class="aseo-run-form" onsubmit="return confirm('Hệ thống sẽ tạo đúng số bài đã chọn. Bạn có muốn bắt đầu?');">
-                        <?php wp_nonce_field('aseo_action_nonce', 'aseo_nonce'); ?>
-                        <input type="hidden" name="aseo_action" value="force_run">
-                        <input type="hidden" class="aseo-primary-keyword-run" name="aseo_primary_keyword_run" value="">
-                        <div class="aseo-post-count">
-                            <label for="aseo_num_posts">Số bài cần tạo</label>
-                            <select id="aseo_num_posts" name="aseo_num_posts">
-                                <option value="1">1</option>
-                                <option value="2">2</option>
-                                <option value="3">3</option>
-                                <option value="5">5</option>
-                                <option value="10">10</option>
-                            </select>
-                        </div>
-                        <button type="submit" class="aseo-btn aseo-btn-run">✍️ Bắt đầu tạo bài</button>
                     </form>
 
                     <?php if ($count_generated > 0) : ?>
@@ -1687,6 +2065,7 @@ class Agent_SEO_Settings {
                     </div>
                 </div>
             </div>
+                </div>
         </div>
 
         <script>
@@ -1814,6 +2193,7 @@ class Agent_SEO_Settings {
             var progressMessage = document.getElementById('aseo-progress-message');
             var progressLabel = document.getElementById('aseo-progress-label');
             var progressTimerEl = document.getElementById('aseo-progress-timer');
+            var stopBatchButton = document.getElementById('aseo-stop-batch');
             var progressTimer = null;
             var liveTimerInterval = null;
             var currentBatchStartedAt = 0;
@@ -1841,7 +2221,7 @@ class Agent_SEO_Settings {
                 }
                 var nowSecs = Math.floor(Date.now() / 1000);
                 var elapsed = 0;
-                if (currentBatchStatus === 'complete' || currentBatchStatus === 'failed') {
+                if (currentBatchStatus === 'complete' || currentBatchStatus === 'failed' || currentBatchStatus === 'stopped') {
                     var endSecs = currentBatchFinishedAt > 0 ? currentBatchFinishedAt : nowSecs;
                     elapsed = Math.max(0, endSecs - currentBatchStartedAt);
                 } else {
@@ -1855,14 +2235,21 @@ class Agent_SEO_Settings {
                 progressCard.className = 'aseo-progress-card visible ' + batch.status;
                 progressFill.style.width = (batch.percent || 0) + '%';
                 progressCount.textContent = (batch.completed || 0) + '/' + (batch.total || 0) + ' bài';
-                progressMessage.textContent = batch.message || '';
+                progressMessage.textContent = (batch.status === 'complete' && (!batch.message || /^Đang viết/i.test(batch.message)))
+                    ? 'Đã hoàn tất nội dung và các tác vụ ảnh.' : (batch.message || '');
                 
                 currentBatchStartedAt = parseInt(batch.started_at, 10) || 0;
                 currentBatchFinishedAt = parseInt(batch.finished_at, 10) || 0;
                 currentBatchStatus = batch.status || '';
+                var batchIsActive = ['queued', 'running', 'waiting', 'images_pending'].indexOf(currentBatchStatus) !== -1;
+                if (stopBatchButton) {
+                    stopBatchButton.style.display = batchIsActive ? '' : 'none';
+                    stopBatchButton.disabled = false;
+                    stopBatchButton.textContent = '■ Dừng tiến trình';
+                }
                 updateTimerDisplay();
 
-                if (batch.status === 'complete' || batch.status === 'failed') {
+                if (batch.status === 'complete' || batch.status === 'failed' || batch.status === 'stopped') {
                     if (liveTimerInterval) { window.clearInterval(liveTimerInterval); liveTimerInterval = null; }
                 } else if (!liveTimerInterval && currentBatchStartedAt > 0) {
                     liveTimerInterval = window.setInterval(updateTimerDisplay, 1000);
@@ -1872,6 +2259,8 @@ class Agent_SEO_Settings {
                     progressLabel.textContent = 'Hoàn tất tạo bài';
                 } else if (batch.status === 'failed') {
                     progressLabel.textContent = 'Tạo bài gặp lỗi';
+                } else if (batch.status === 'stopped') {
+                    progressLabel.textContent = 'Đã dừng tiến trình';
                 } else if (batch.status === 'images_pending') {
                     progressLabel.textContent = 'Đang hoàn thiện ảnh và bố cục bài';
                 } else {
@@ -1891,7 +2280,7 @@ class Agent_SEO_Settings {
                 }).then(function(response) { return response.json(); }).then(function(payload) {
                     if (!payload.success) return;
                     renderBatchProgress(payload.data);
-                    if (payload.data.status === 'complete' || payload.data.status === 'failed' || payload.data.status === 'idle') {
+                    if (payload.data.status === 'complete' || payload.data.status === 'failed' || payload.data.status === 'stopped' || payload.data.status === 'idle') {
                         if (progressTimer) window.clearInterval(progressTimer);
                     }
                 }).catch(function() {});
@@ -1900,8 +2289,10 @@ class Agent_SEO_Settings {
             if (progressCard) {
                 currentBatchStartedAt = parseInt(progressCard.getAttribute('data-started'), 10) || 0;
                 currentBatchFinishedAt = parseInt(progressCard.getAttribute('data-finished'), 10) || 0;
-                if (progressCard.classList.contains('complete') || progressCard.classList.contains('failed')) {
-                    currentBatchStatus = progressCard.classList.contains('complete') ? 'complete' : 'failed';
+                if (progressCard.classList.contains('complete') || progressCard.classList.contains('failed') || progressCard.classList.contains('stopped')) {
+                    currentBatchStatus = progressCard.classList.contains('complete')
+                        ? 'complete'
+                        : (progressCard.classList.contains('stopped') ? 'stopped' : 'failed');
                 } else if (progressCard.classList.contains('visible')) {
                     currentBatchStatus = 'running';
                 }
@@ -1913,6 +2304,35 @@ class Agent_SEO_Settings {
                     pollBatchProgress();
                     progressTimer = window.setInterval(pollBatchProgress, 5000);
                 }
+            }
+
+            if (stopBatchButton) {
+                stopBatchButton.addEventListener('click', function() {
+                    if (!window.confirm('Dừng tiến trình hiện tại? Bài và ảnh đã hoàn tất sẽ được giữ lại.')) return;
+                    stopBatchButton.disabled = true;
+                    stopBatchButton.textContent = 'Đang dừng...';
+                    var body = new URLSearchParams();
+                    body.append('action', 'agent_seo_stop_batch');
+                    body.append('nonce', '<?php echo esc_js(wp_create_nonce('agent_seo_stop_batch')); ?>');
+                    fetch('<?php echo esc_url(admin_url('admin-ajax.php')); ?>', {
+                        method: 'POST',
+                        credentials: 'same-origin',
+                        headers: {'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8'},
+                        body: body.toString()
+                    }).then(function(response) {
+                        return response.json();
+                    }).then(function(payload) {
+                        if (!payload.success) {
+                            throw new Error(payload.data && payload.data.message ? payload.data.message : 'Không thể dừng tiến trình.');
+                        }
+                        renderBatchProgress(payload.data);
+                        if (progressTimer) { window.clearInterval(progressTimer); progressTimer = null; }
+                    }).catch(function(error) {
+                        stopBatchButton.disabled = false;
+                        stopBatchButton.textContent = '■ Dừng tiến trình';
+                        window.alert(error.message || 'Không thể dừng tiến trình.');
+                    });
+                });
             }
 
             // Tab switching
@@ -2049,19 +2469,128 @@ class Agent_SEO_Settings {
             }
 
             var primaryKeywordInput = document.getElementById('aseo_primary_keyword_seo');
+            var briefChatSubmit = document.getElementById('aseo-brief-chat-submit');
+            var briefChatInput = document.getElementById('aseo-brief-chat-input');
+            var briefChatStatus = document.getElementById('aseo-brief-chat-status');
+            var briefPromptSubmit = document.getElementById('aseo-brief-prompt-submit');
+            if (briefPromptSubmit) {
+                briefPromptSubmit.addEventListener('click', function() {
+                    var request = briefChatInput ? briefChatInput.value.trim() : '';
+                    var masterBrief = document.getElementById('aseo_master_prompt_brief');
+                    if (!request) { if (briefChatInput) briefChatInput.focus(); return; }
+                    if (!masterBrief || !generateMasterButton) {
+                        if (briefChatStatus) briefChatStatus.textContent = 'Không tìm thấy cấu hình prompt.';
+                        return;
+                    }
+                    masterBrief.value = request;
+                    masterBrief.dispatchEvent(new Event('input', {bubbles:true}));
+                    if (briefChatStatus) briefChatStatus.textContent = 'AI đang tạo prompt viết và ảnh...';
+                    briefPromptSubmit.disabled = true;
+                    generateMasterButton.click();
+                });
+            }
+            if (briefChatSubmit && briefChatInput) {
+                briefChatSubmit.addEventListener('click', function() {
+                    var request = briefChatInput.value.trim();
+                    if (!request) { briefChatInput.focus(); return; }
+                    briefChatSubmit.disabled = true;
+                    briefChatSubmit.textContent = 'AI đang phân tích...';
+                    if (briefChatStatus) briefChatStatus.textContent = 'Đang điền các trường bên dưới';
+                    var body = new URLSearchParams();
+                    body.append('action', 'agent_seo_prepare_assistant');
+                    body.append('nonce', '<?php echo esc_js(wp_create_nonce('agent_seo_prepare_assistant')); ?>');
+                    body.append('brief', request);
+                    fetch('<?php echo esc_url(admin_url('admin-ajax.php')); ?>', {method:'POST', credentials:'same-origin', headers:{'Content-Type':'application/x-www-form-urlencoded; charset=UTF-8'}, body:body.toString()})
+                        .then(function(response){ return response.json(); })
+                        .then(function(payload){
+                            if (!payload.success) throw new Error(payload.data && payload.data.message ? payload.data.message : 'AI không thể phân tích yêu cầu.');
+                            var data = payload.data || {};
+                            var values = data.brief || {};
+                            values = {topic:values.topic || '', location:values.location || '', intent:values.intent || '', reference:values.backlink || '', secondary:values.secondary_keywords || '', instructions:values.instructions || ''};
+                            Object.keys(values).forEach(function(key){
+                                var field = briefFields && briefFields[key]
+                                    ? briefFields[key]
+                                    : document.getElementById('aseo_article_' + key);
+                                if (!field) return;
+                                field.value = values[key];
+                                field.dispatchEvent(new Event('input', {bubbles:true}));
+                            });
+                            if (typeof syncArticleBrief === 'function') syncArticleBrief();
+                            var promptPreview = document.getElementById('aseo-article-prompt-preview');
+                            if (!promptPreview) {
+                                promptPreview = document.createElement('div');
+                                promptPreview.id = 'aseo-article-prompt-preview';
+                                promptPreview.className = 'aseo-article-prompt-preview';
+                                document.getElementById('aseo-brief-chat').appendChild(promptPreview);
+                            }
+                            promptPreview.innerHTML = '<strong>Prompt viết & ảnh đã sẵn sàng</strong><code>' + String(data.master_prompt || '').replace(/[&<>]/g, function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;'}[c];}) + '</code>';
+                            if (briefChatStatus) briefChatStatus.textContent = '✓ Đã chuẩn bị xong brief và prompt.';
+                            var createSection = document.getElementById('aseo-create-section');
+                            if (createSection) createSection.scrollIntoView({behavior:'smooth', block:'start'});
+                        })
+                        .catch(function(error){ if (briefChatStatus) briefChatStatus.textContent = error.message; })
+                        .finally(function(){ briefChatSubmit.disabled = false; briefChatSubmit.textContent = '✨ AI chuẩn bị brief & prompt'; });
+                });
+            }
+            var briefPreviewButton = document.getElementById('aseo-preview-brief');
+            var briefPreview = document.getElementById('aseo-outline-preview');
+            var briefFields = {
+                topic: document.getElementById('aseo_article_topic'),
+                location: document.getElementById('aseo_article_location'),
+                intent: document.getElementById('aseo_article_intent'),
+                reference: document.getElementById('aseo_article_reference'),
+                instructions: document.getElementById('aseo_article_instructions'),
+                secondary: document.getElementById('aseo_article_secondary')
+            };
+            function syncArticleBrief() {
+                Object.keys(briefFields).forEach(function(key) {
+                    var hidden = document.getElementById('aseo_article_' + key + '_run');
+                    if (hidden && briefFields[key]) hidden.value = briefFields[key].value.trim();
+                });
+                ['title', 'outline'].forEach(function(key) {
+                    var previewField = document.getElementById('aseo_article_' + key + '_preview');
+                    var hidden = document.getElementById('aseo_article_' + key + '_run');
+                    if (previewField && hidden) hidden.value = previewField.value.trim();
+                });
+            }
+            if (briefPreviewButton) {
+                briefPreviewButton.addEventListener('click', function() {
+                    var topic = briefFields.topic ? briefFields.topic.value.trim() : '';
+                    if (!topic) {
+                        if (briefFields.topic) briefFields.topic.focus();
+                        window.alert('Vui lòng nhập chủ đề hoặc từ khóa cho bài viết.');
+                        return;
+                    }
+                    var location = briefFields.location ? briefFields.location.value.trim() : '';
+                    var intent = briefFields.intent ? briefFields.intent.value : '';
+                    var reference = briefFields.reference ? briefFields.reference.value.trim() : '';
+                    var safeTopic = topic.replace(/[&<>\"']/g, function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;',"'":'&#039;'}[c];});
+                    var title = topic.charAt(0).toUpperCase() + topic.slice(1) + (location ? ' tại ' + location : '') + ': Hướng dẫn chi tiết';
+                    var html = '<strong>Bước 2 — Duyệt tiêu đề & dàn ý</strong><label class="aseo-create-control"><span>Tiêu đề bài viết</span><input type="text" id="aseo_article_title_preview" value="' + title.replace(/\"/g,'&quot;') + '"></label>';
+                    html += '<label class="aseo-create-control"><span>Dàn ý có thể chỉnh sửa (mỗi dòng một H2/H3)</span><textarea id="aseo_article_outline_preview" rows="5">H2. ' + safeTopic + '\nH2. Tiêu chí lựa chọn và thông tin cần biết\nH2. Hướng dẫn thực tế cho người mua\nH2. Câu hỏi thường gặp (FAQ)\nH2. Kết luận và CTA</textarea></label>';
+                    html += '<small>Ý định: ' + intent + (reference ? ' · Backlink: ' + reference : '') + '</small>';
+                    briefPreview.innerHTML = html;
+                    briefPreview.classList.add('is-visible');
+                    syncArticleBrief();
+                    var titlePreview = document.getElementById('aseo_article_title_preview');
+                    var outlinePreview = document.getElementById('aseo_article_outline_preview');
+                    if (titlePreview) titlePreview.addEventListener('input', syncArticleBrief);
+                    if (outlinePreview) outlinePreview.addEventListener('input', syncArticleBrief);
+                });
+            }
             document.querySelectorAll('form input[name="aseo_action"][value="force_run"]').forEach(function(actionInput) {
                 var runForm = actionInput.closest('form');
                 if (!runForm) return;
                 runForm.addEventListener('submit', function() {
+                    syncArticleBrief();
                     var keywordBridge = runForm.querySelector('.aseo-primary-keyword-run');
                     if (keywordBridge && primaryKeywordInput) keywordBridge.value = primaryKeywordInput.value.trim();
                 });
             });
 
             var autosaveStatus = document.getElementById('aseo-autosave-status');
-            if (autosaveStatus) autosaveStatus.textContent = '✓ Thay đổi sẽ tự động được lưu';
+            if (autosaveStatus) autosaveStatus.textContent = 'Tự lưu khi thay đổi · bấm Lưu để chắc chắn';
             var settingsForm = document.getElementById('aseo-settings-form');
-            if (settingsForm) settingsForm.addEventListener('submit', function(event) { event.preventDefault(); });
             var autosaveTimers = {};
             var autosaveFields = document.querySelectorAll('#aseo-settings-form input[name], #aseo-settings-form textarea[name], #aseo-settings-form select[name]');
             var autosaveNames = {
@@ -2072,8 +2601,9 @@ class Agent_SEO_Settings {
                 'aseo_brand_price': true, 'aseo_brand_cta': true, 'aseo_gsc_property': true,
                 'aseo_gsc_sitemap_url': true, 'aseo_reference_image_id': true,
                 'aseo_gemini_api_key': true, 'aseo_nvidia_api_key': true,
-                'aseo_duky_api_key': true, 'aseo_duky_model': true,
+                'aseo_duky_api_key': true, 'aseo_duky_model': true, 'aseo_kaggle_api_url': true,
                 'aseo_image_engine': true, 'aseo_indexnow_key': true,
+                'aseo_enable_inline_images': true,
                 'aseo_gsc_client_id': true, 'aseo_gsc_client_secret': true,
                 'aseo_source_website': true, 'aseo_master_text_prompt': true,
                 'aseo_master_image_prompt': true, 'aseo_post_status': true
@@ -2087,7 +2617,7 @@ class Agent_SEO_Settings {
                     saveBody.append('action', 'agent_seo_autosave_setting');
                     saveBody.append('nonce', '<?php echo esc_js(wp_create_nonce('agent_seo_autosave_setting')); ?>');
                     saveBody.append('field', field.name);
-                    saveBody.append('value', field.value);
+                    saveBody.append('value', field.type === 'checkbox' ? (field.checked ? '1' : '0') : field.value);
                     fetch('<?php echo esc_url(admin_url('admin-ajax.php')); ?>', {
                         method: 'POST', credentials: 'same-origin',
                         headers: {'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8'},

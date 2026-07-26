@@ -52,21 +52,62 @@ class Agent_SEO_Gemini_Text {
         return array('success' => false, 'message' => 'Phản hồi từ AI không đúng định dạng mong đợi: ' . $text);
     }
 
+    public static function parse_article_brief($api_key, $brief) {
+        $url = 'https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-flash-lite:generateContent?key=' . rawurlencode($api_key);
+        $instruction = "Phân tích yêu cầu viết bài SEO dưới đây và trả về DUY NHẤT JSON hợp lệ, không markdown. "
+            . "Các khóa bắt buộc: topic, location, intent, backlink, secondary_keywords, instructions. "
+            . "topic là chủ đề chính; location là khu vực; intent chọn một trong: Tìm hiểu thông tin, So sánh và lựa chọn, Tìm nơi mua / nhận báo giá, Hướng dẫn sử dụng. "
+            . "secondary_keywords là chuỗi tối đa 5 từ khóa, ngăn cách bằng dấu phẩy. Nếu không có dữ liệu thì để chuỗi rỗng. "
+            . "Không được bịa backlink; chỉ dùng URL xuất hiện trong yêu cầu. Yêu cầu: " . $brief;
+        $response = wp_remote_post($url, array(
+            'headers' => array('Content-Type' => 'application/json'),
+            'body' => wp_json_encode(array('contents' => array(array('parts' => array(array('text' => $instruction))))), JSON_UNESCAPED_UNICODE),
+            'timeout' => 30
+        ));
+        if (is_wp_error($response)) return array('success' => false, 'message' => $response->get_error_message());
+        $code = wp_remote_retrieve_response_code($response);
+        $data = json_decode(wp_remote_retrieve_body($response), true);
+        if ($code < 200 || $code >= 300) {
+            return array('success' => false, 'message' => isset($data['error']['message']) ? $data['error']['message'] : 'Lỗi API HTTP ' . $code);
+        }
+        $text = isset($data['candidates'][0]['content']['parts'][0]['text']) ? trim($data['candidates'][0]['content']['parts'][0]['text']) : '';
+        $text = preg_replace('/^```(?:json)?\s*|\s*```$/i', '', $text);
+        $parsed = json_decode(trim($text), true);
+        if (!is_array($parsed)) return array('success' => false, 'message' => 'AI trả về dữ liệu không đúng định dạng.');
+        return array('success' => true, 'brief' => array(
+            'topic' => sanitize_text_field(isset($parsed['topic']) ? $parsed['topic'] : ''),
+            'location' => sanitize_text_field(isset($parsed['location']) ? $parsed['location'] : ''),
+            'intent' => sanitize_text_field(isset($parsed['intent']) ? $parsed['intent'] : 'Tìm hiểu thông tin'),
+            'backlink' => esc_url_raw(isset($parsed['backlink']) ? $parsed['backlink'] : ''),
+            'secondary_keywords' => sanitize_text_field(isset($parsed['secondary_keywords']) ? $parsed['secondary_keywords'] : ''),
+            'instructions' => sanitize_textarea_field(isset($parsed['instructions']) ? $parsed['instructions'] : '')
+        ));
+    }
+
     /**
      * Viết bài viết chi tiết dựa trên từ khóa bằng Gemini 3.1 Flash Lite
      * Trả về mảng chứa title, excerpt, content
      */
-    public static function generate_content($api_key, $keyword, $niche, $brand_voice, $brand_data = array()) {
+    public static function generate_content($api_key, $keyword, $niche, $brand_voice, $brand_data = array(), $batch_started_at = 0) {
         $url = 'https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-flash-lite:generateContent?key=' . $api_key;
 
         $brand_name = isset($brand_data['brand_name']) ? trim($brand_data['brand_name']) : '';
-        $brand_address = isset($brand_data['brand_address']) ? trim($brand_data['brand_address']) : '';
-        $brand_phone = isset($brand_data['brand_phone']) ? trim($brand_data['brand_phone']) : '';
+        $brand_address = self::normalize_contact_value(isset($brand_data['brand_address']) ? $brand_data['brand_address'] : '');
+        $brand_phone = self::normalize_contact_value(isset($brand_data['brand_phone']) ? $brand_data['brand_phone'] : '');
         $brand_contact = isset($brand_data['brand_contact']) ? trim($brand_data['brand_contact']) : '';
         $brand_price = isset($brand_data['brand_price']) ? trim($brand_data['brand_price']) : '';
         $brand_cta = isset($brand_data['brand_cta']) ? trim($brand_data['brand_cta']) : '';
         $article_topic = isset($brand_data['article_topic']) ? trim($brand_data['article_topic']) : '';
         $global_secondary_keywords = isset($brand_data['global_secondary_keywords']) ? trim($brand_data['global_secondary_keywords']) : '';
+        $source_website = isset($brand_data['source_website']) ? trim($brand_data['source_website']) : '';
+        $user_brief = isset($brand_data['user_brief']) ? trim($brand_data['user_brief']) : '';
+        $backlink_url = '';
+        if (preg_match('#https?://[^\s<>"\']+#i', $user_brief, $brief_url_match)) {
+            $backlink_url = esc_url_raw(rtrim($brief_url_match[0], '.,);'));
+        }
+        if (empty($backlink_url) && !empty($source_website)) {
+            $backlink_url = esc_url_raw($source_website);
+        }
 
         $brand_section = "";
         if (!empty($brand_name)) {
@@ -196,8 +237,8 @@ Yêu cầu bài viết để chuẩn E-E-A-T của Google:
        Khách hàng cần tư vấn, báo giá hoặc thông tin chi tiết về chủ đề này, vui lòng liên hệ:
        <ul>
          <li><strong>" . (!empty($brand_name) ? $brand_name : 'Đơn vị cung cấp') . "</strong></li>
-         <li><strong>Địa chỉ:</strong> " . (!empty($brand_address) ? $brand_address : 'Xem thông tin liên hệ trên website') . "</li>
-         <li><strong>Hotline/Zalo:</strong> " . (!empty($brand_phone) ? $brand_phone : 'Xem thông tin liên hệ trên website') . "</li>
+         " . (!empty($brand_address) ? '<li><strong>Địa chỉ:</strong> ' . $brand_address . '</li>' : '') . "
+         " . (!empty($brand_phone) ? '<li><strong>Hotline/Zalo:</strong> ' . $brand_phone . '</li>' : '') . "
        </ul>
      </div>
     - **Liên kết ngoài (Outbound Link):** Bắt buộc chèn ít nhất một liên kết tự nhiên trỏ ra ngoài trang web uy tín khác (ví dụ: liên kết tới Wikipedia tiếng Việt về chủ đề/loại sản phẩm tương ứng, hoặc các trang báo chí lớn, nguồn tài liệu khoa học chính thống) bằng một anchor text tự nhiên và có ý nghĩa (không được dùng anchor text chung chung như \"tại đây\" hay \"xem thêm\"). Liên kết này phải là link dofollow để tối ưu SEO.
@@ -223,6 +264,14 @@ Yêu cầu bài viết để chuẩn E-E-A-T của Google:
         }
 
         $prompt .= "\n\nCRITICAL GENERALIZATION RULE: This plugin serves websites in any industry. Ignore and replace any rice, agriculture, food, Cần Thơ, moisture, grain, harvest, or wholesale examples in the template when they do not match the configured niche and actual product/service. Build headings, comparison criteria, use cases, CTA and image scene dynamically from the supplied niche and product data. Never invent industry-specific facts. If product image, price, address or phone is missing, omit that element instead of using sample data.\n";
+
+        $prompt .= "\n\nFACTUAL CONTACT AND BACKLINK RULES — HIGHEST PRIORITY:\n"
+            . "- Dữ liệu thương hiệu, địa chỉ, hotline và URL dưới đây là nguồn sự thật. Nếu trường nào có giá trị, phải sao chép đúng giá trị đó; không thay bằng cách nói chung chung.\n"
+            . "- TUYỆT ĐỐI KHÔNG được viết các placeholder như \"Xem thông tin liên hệ trên website\", \"liên hệ trên website\", \"xem website để biết địa chỉ\", \"hotline cập nhật trên website\" hoặc câu tương đương. Nếu thiếu một trường, bỏ hẳn dòng đó.\n"
+            . (!empty($source_website) ? "- Website chính thức cần được nhắc tới bằng một liên kết HTML tự nhiên: " . $source_website . "\n" : '')
+            . (!empty($backlink_url) ? "- BACKLINK BẮT BUỘC: phải có ít nhất một thẻ <a href=\"" . esc_attr($backlink_url) . "\"> với anchor text mô tả thương hiệu/sản phẩm, đặt tự nhiên trong phần giới thiệu hoặc CTA. Không được bỏ qua URL này.\n" : '')
+            . (!empty($user_brief) ? "- YÊU CẦU TRỰC TIẾP CỦA CHỦ WEBSITE (ưu tiên cao): " . $user_brief . "\n" : '')
+            . "\n";
 
         if (!empty($article_topic) && $article_topic !== $keyword) {
             $prompt .= "\n\nARTICLE SUBTOPIC FOR THIS SPECIFIC ARTICLE: \"{$article_topic}\". Use this as the unique angle and supporting topic while keeping \"{$keyword}\" as the only primary keyword for the whole content cluster. Include several natural secondary/LSI phrases related to this subtopic, but do not replace the primary keyword.\n";
@@ -285,6 +334,9 @@ Yêu cầu bài viết để chuẩn E-E-A-T của Google:
 
         $code = wp_remote_retrieve_response_code($response);
         $res_body = wp_remote_retrieve_body($response);
+        if (self::is_batch_stopped($batch_started_at)) {
+            return array('success' => false, 'message' => 'Tiến trình đã được người dùng dừng.');
+        }
 
         if ($code !== 200) {
             $data = json_decode($res_body, true);
@@ -310,6 +362,9 @@ Yêu cầu bài viết để chuẩn E-E-A-T của Google:
         $article = json_decode($json_text, true);
 
         if (json_last_error() !== JSON_ERROR_NONE) {
+            if (self::is_batch_stopped($batch_started_at)) {
+                return array('success' => false, 'message' => 'Tiến trình đã được người dùng dừng.');
+            }
             error_log('Agent SEO Raw Gemini Response: ' . $json_text);
             // Retry once with a stricter instruction and lower temperature. This is useful
             // when long HTML attributes contain quotes that the first response did not escape.
@@ -352,6 +407,9 @@ Yêu cầu bài viết để chuẩn E-E-A-T của Google:
         preg_match_all('/\S+/u', wp_strip_all_tags($article['content']), $word_matches);
         $word_count = isset($word_matches[0]) ? count($word_matches[0]) : 0;
         if ($word_count < 1050) {
+            if (self::is_batch_stopped($batch_started_at)) {
+                return array('success' => false, 'message' => 'Tiến trình đã được người dùng dừng.');
+            }
             $expand_prompt = "Mở rộng HTML bài viết dưới đây thành khoảng 1200-1500 từ tiếng Việt. Giữ nguyên chủ đề, dữ liệu thực tế, từ khóa chính và các thông tin sản phẩm; không bịa thêm giá, chứng nhận hay địa chỉ. Bổ sung phân tích, ví dụ, quy trình, tiêu chí lựa chọn và FAQ liên quan. Giữ cấu trúc H2/H3, bảng, CTA hiện có; không thêm h1, markdown hay lời giải thích. Chỉ trả về HTML nội dung hoàn chỉnh.\n\nHTML hiện tại:\n" . $article['content'];
             $expand_body = array(
                 'contents' => array(array('parts' => array(array('text' => $expand_prompt)))),
@@ -374,6 +432,10 @@ Yêu cầu bài viết để chuẩn E-E-A-T của Google:
             }
         }
 
+        // Lớp bảo vệ cuối cùng: AI đôi khi vẫn lặp lại placeholder hoặc bỏ qua
+        // backlink dù prompt đã yêu cầu. Chuẩn hóa HTML trước khi trả về worker.
+        $article['content'] = self::enforce_contact_and_backlink($article['content'], $brand_data, $backlink_url);
+
         return array(
             'success'          => true,
             'seo_title'        => sanitize_text_field($article['seo_title']),
@@ -384,6 +446,55 @@ Yêu cầu bài viết để chuẩn E-E-A-T của Google:
             'content'          => $article['content'], // Giữ nguyên HTML
             'image_prompt'     => sanitize_text_field($article['image_prompt'])
         );
+    }
+
+    private static function enforce_contact_and_backlink($content, $brand_data, $backlink_url = '') {
+        $content = (string) $content;
+        $address = isset($brand_data['brand_address']) ? trim($brand_data['brand_address']) : '';
+        $phone = isset($brand_data['brand_phone']) ? trim($brand_data['brand_phone']) : '';
+        $brand_name = isset($brand_data['brand_name']) ? trim($brand_data['brand_name']) : 'website chính thức';
+        $placeholder = '(?:Xem thông tin liên hệ trên website|xem thông tin liên hệ trên website|liên hệ trên website|xem website để biết địa chỉ|hotline cập nhật trên website)';
+
+        if ($address !== '' && !preg_match('/' . $placeholder . '/iu', $address)) {
+            $content = preg_replace('/(<strong>\s*Địa chỉ\s*:\s*<\/strong>\s*)' . $placeholder . '/iu', '$1' . esc_html($address), $content);
+        } else {
+            $content = preg_replace('/\s*<li[^>]*>\s*<strong>\s*Địa chỉ\s*:\s*<\/strong>\s*' . $placeholder . '\s*<\/li>\s*/iu', '', $content);
+        }
+
+        if ($phone !== '' && !preg_match('/' . $placeholder . '/iu', $phone)) {
+            $content = preg_replace('/(<strong>\s*Hotline(?:\/Zalo)?\s*:\s*<\/strong>\s*)' . $placeholder . '/iu', '$1' . esc_html($phone), $content);
+        } else {
+            $content = preg_replace('/\s*<li[^>]*>\s*<strong>\s*Hotline(?:\/Zalo)?\s*:\s*<\/strong>\s*' . $placeholder . '\s*<\/li>\s*/iu', '', $content);
+        }
+
+        // Không để placeholder lọt ra ngoài list HTML do AI tự đổi layout.
+        $content = preg_replace('/\b' . $placeholder . '\b/iu', '', $content);
+
+        $backlink_url = esc_url_raw($backlink_url);
+        if ($backlink_url !== '' && !preg_match('/<a\b[^>]*href=["\']' . preg_quote($backlink_url, '/') . '["\']/iu', $content)) {
+            $content .= '<p>Tham khảo thêm thông tin từ <a href="' . esc_url($backlink_url) . '">' . esc_html($brand_name) . '</a>.</p>';
+        }
+        return $content;
+    }
+
+    private static function normalize_contact_value($value) {
+        $value = trim((string) $value);
+        if ($value === '' || preg_match('/(?:xem thông tin liên hệ trên website|liên hệ trên website|xem website để biết địa chỉ|hotline cập nhật trên website)/iu', $value)) {
+            return '';
+        }
+        return $value;
+    }
+
+    private static function is_batch_stopped($batch_started_at) {
+        $batch_started_at = intval($batch_started_at);
+        if ($batch_started_at <= 0) {
+            return false;
+        }
+        $batch = get_option('aseo_batch_status', array());
+        return is_array($batch)
+            && isset($batch['status'], $batch['started_at'])
+            && $batch['status'] === 'stopped'
+            && intval($batch['started_at']) === $batch_started_at;
     }
 
     /**
