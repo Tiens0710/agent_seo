@@ -192,6 +192,13 @@ class Agent_SEO_Orchestrator {
             $post_ids = isset($batch['post_ids']) && is_array($batch['post_ids']) ? $batch['post_ids'] : array();
             $post_ids[] = intval($result['post_id']);
             $batch['post_ids'] = array_values(array_unique(array_filter(array_map('absint', $post_ids))));
+            if (!empty($result['review_required'])) {
+                $review_posts = isset($batch['review_required_posts']) && is_array($batch['review_required_posts'])
+                    ? $batch['review_required_posts']
+                    : array();
+                $review_posts[] = intval($result['post_id']);
+                $batch['review_required_posts'] = array_values(array_unique(array_filter(array_map('absint', $review_posts))));
+            }
             $batch['updated_at'] = time();
             if (!empty($result['image_warning'])) {
                 $result_post_id = intval($result['post_id']);
@@ -224,7 +231,7 @@ class Agent_SEO_Orchestrator {
             $batch['requested_status'] = $requested_status;
             if ($remaining > 0) {
                 $batch['status'] = 'waiting';
-                $batch['message'] = 'Đã lưu bài ' . intval($batch['completed']) . '/' . intval($batch['total']) . '. Ảnh đang chạy nền; hệ thống đang chuẩn bị bài tiếp theo...';
+                $batch['message'] = 'Đã lưu bản nháp ' . intval($batch['completed']) . '/' . intval($batch['total']) . '. Đang chuẩn bị nội dung bài tiếp theo...';
             } else {
                 $batch['completed'] = intval($batch['total']);
                 $total_pending = intval(!empty($batch['pending_images']) ? count($batch['pending_images']) : 0) + intval(!empty($batch['pending_inline_images']) ? count($batch['pending_inline_images']) : 0);
@@ -233,11 +240,18 @@ class Agent_SEO_Orchestrator {
                     $batch['message'] = 'Đã viết xong ' . intval($batch['total']) . ' bài. Đang hoàn thiện ' . $total_pending . ' bài chưa đủ ảnh...';
                 } else {
                     $batch['status'] = 'complete';
+                    $review_count = !empty($batch['review_required_posts']) && is_array($batch['review_required_posts'])
+                        ? count($batch['review_required_posts'])
+                        : 0;
                     $failed_count = !empty($batch['image_errors']) && is_array($batch['image_errors'])
                         ? count($batch['image_errors']) : 0;
-                    $batch['message'] = $failed_count > 0
-                        ? 'Đã tạo xong ' . intval($batch['total']) . ' bài; có ' . $failed_count . ' bài chưa đủ ảnh sau các lần thử.'
-                        : 'Đã tạo xong toàn bộ ' . intval($batch['total']) . ' bài viết và ảnh đại diện/ảnh phụ.';
+                    if ($review_count > 0) {
+                        $batch['message'] = 'Đã tạo xong ' . $review_count . ' bản nháp. Hãy kiểm tra nội dung rồi bấm “Duyệt nội dung & tạo ảnh”.';
+                    } else {
+                        $batch['message'] = $failed_count > 0
+                            ? 'Đã tạo xong ' . intval($batch['total']) . ' bài; có ' . $failed_count . ' bài chưa đủ ảnh sau các lần thử.'
+                            : 'Đã tạo xong toàn bộ ' . intval($batch['total']) . ' bài viết và ảnh đại diện/ảnh phụ.';
+                    }
                     $batch['finished_at'] = time();
                 }
             }
@@ -586,10 +600,17 @@ class Agent_SEO_Orchestrator {
             }
             if ($completed >= $total) {
                 $batch['status'] = 'complete';
+                $review_count = !empty($batch['review_required_posts']) && is_array($batch['review_required_posts'])
+                    ? count($batch['review_required_posts'])
+                    : 0;
                 $failed_count = !empty($batch['image_errors']) ? count($batch['image_errors']) : 0;
-                $batch['message'] = $failed_count > 0
-                    ? 'Đã tạo xong bài viết; có ' . $failed_count . ' ảnh chưa tạo được sau nhiều lần thử.'
-                    : 'Đã tạo xong toàn bộ bài viết và ảnh đại diện/ảnh phụ.';
+                if ($review_count > 0) {
+                    $batch['message'] = 'Đã hoàn tất ảnh của bài vừa duyệt. Còn ' . $review_count . ' bản nháp đang chờ kiểm tra nội dung.';
+                } else {
+                    $batch['message'] = $failed_count > 0
+                        ? 'Đã tạo xong bài viết; có ' . $failed_count . ' ảnh chưa tạo được sau nhiều lần thử.'
+                        : 'Đã tạo xong toàn bộ bài viết và ảnh đại diện/ảnh phụ.';
+                }
                 $batch['finished_at'] = time();
             }
         }
@@ -621,7 +642,9 @@ class Agent_SEO_Orchestrator {
             delete_post_meta($post_id, '_agent_seo_inline_image_job');
             delete_post_meta($post_id, '_agent_seo_inline_image_attempts');
             delete_post_meta($post_id, '_agent_seo_inline_image_polls');
-            $this->mark_batch_image_finished($post_id, !empty($featured_id));
+            $success = !empty($featured_id);
+            $this->maybe_publish_after_approved_images($post_id, $success);
+            $this->mark_batch_image_finished($post_id, $success);
             return;
         }
 
@@ -635,7 +658,30 @@ class Agent_SEO_Orchestrator {
 
         // 3. Cả hai job đã kết thúc. Chỉ báo success khi thật sự có đủ hai ảnh.
         $success = !empty($featured_id) && (!$this->inline_images_enabled() || count($inline_ids) >= 1);
+        $this->maybe_publish_after_approved_images($post_id, $success);
         $this->mark_batch_image_finished($post_id, $success);
+    }
+
+    /**
+     * Giai đoạn 2 chỉ xuất bản sau khi người dùng đã duyệt nội dung và toàn bộ
+     * ảnh được yêu cầu đã hoàn tất. Nếu chọn lưu nháp, bài vẫn giữ nguyên.
+     */
+    private function maybe_publish_after_approved_images($post_id, $success) {
+        $post_id = absint($post_id);
+        if (
+            !$success
+            || get_post_meta($post_id, '_agent_seo_image_approved', true) !== '1'
+        ) {
+            return;
+        }
+        update_post_meta($post_id, '_agent_seo_image_stage_complete', '1');
+        if (get_post_meta($post_id, '_agent_seo_publish_after_images', true) !== '1') {
+            return;
+        }
+        $post = get_post($post_id);
+        if ($post && $post->post_type === 'post' && $post->post_status !== 'publish') {
+            wp_update_post(array('ID' => $post_id, 'post_status' => 'publish'));
+        }
     }
 
     /**
@@ -715,9 +761,6 @@ class Agent_SEO_Orchestrator {
         $nvidia_key = get_option('aseo_nvidia_api_key', '');
         $engine = get_option('aseo_image_engine', 'duky');
         $kaggle_url = get_option('aseo_kaggle_api_url', '');
-        if (!empty($kaggle_url)) {
-            $engine = 'kaggle';
-        }
         $prompt = isset($job['prompt']) ? $job['prompt'] : '';
         $title = isset($job['title']) ? $job['title'] : get_the_title($post_id);
         $keyword = isset($job['keyword']) ? $job['keyword'] : '';
@@ -1048,13 +1091,15 @@ class Agent_SEO_Orchestrator {
         }
         $rank_math_keywords = implode(', ', $rank_math_keywords_list);
 
-        // 3. Lưu bài theo trạng thái cấu hình; mặc định là bản nháp để người dùng duyệt trước
-        $post_status = in_array($requested_status, array('draft', 'publish'), true)
+        // Giai đoạn 1 luôn lưu nháp để người dùng kiểm tra thông tin. Nếu người
+        // dùng chọn tự xuất bản, chỉ xuất bản sau khi họ duyệt và ảnh tạo đủ.
+        $requested_post_status = in_array($requested_status, array('draft', 'publish'), true)
             ? $requested_status
             : get_option('aseo_post_status', 'publish');
-        if (!in_array($post_status, array('draft', 'publish'), true)) {
-            $post_status = 'publish';
+        if (!in_array($requested_post_status, array('draft', 'publish'), true)) {
+            $requested_post_status = 'draft';
         }
+        $post_status = 'draft';
 
         // Slug phải chứa primary keyword exact-match để Rank Math không báo thiếu từ khóa trong URL.
         // Ghép thêm topic để mỗi bài trong cụm vẫn có slug riêng.
@@ -1091,6 +1136,8 @@ class Agent_SEO_Orchestrator {
             'post_author'  => 1, // Gán cho Admin
             'meta_input'   => array(
                 '_agent_seo_generated' => '1',
+                '_agent_seo_awaiting_image_approval' => '1',
+                '_agent_seo_publish_after_images' => $requested_post_status === 'publish' ? '1' : '0',
                 '_agent_seo_batch_started_at' => intval($batch_started_at),
                 '_agent_seo_keyword'   => $target_keyword,
                 '_agent_seo_primary_keyword' => $primary_keyword,
@@ -1192,6 +1239,9 @@ class Agent_SEO_Orchestrator {
             'product_image_id' => isset($brand_data['product_image_id']) ? absint($brand_data['product_image_id']) : 0
         );
         update_post_meta($post_id, '_agent_seo_image_job', $image_job);
+        // Giữ một bản prompt/job gốc để người dùng có thể sửa ảnh sau khi
+        // worker đã dọn job tạm thời lúc tạo ảnh thành công.
+        update_post_meta($post_id, '_agent_seo_base_image_job', $image_job);
         // Ảnh trong thân bài là tùy chọn; mặc định tắt để batch không bị kéo dài.
         if ($this->inline_images_enabled()) {
             update_post_meta($post_id, '_agent_seo_inline_image_job', $image_job);
@@ -1200,17 +1250,9 @@ class Agent_SEO_Orchestrator {
         }
         update_post_meta($post_id, '_agent_seo_inline_image_ids', array());
         update_post_meta($post_id, '_agent_seo_image_attempts', 0);
-        if (!wp_next_scheduled('agent_seo_image_retry_task', array($post_id))) {
-            $scheduled = wp_schedule_single_event(time() + 1, 'agent_seo_image_retry_task', array($post_id), true);
-            if (is_wp_error($scheduled)) {
-                error_log('Agent SEO could not schedule featured image worker for post ' . intval($post_id) . ': ' . $scheduled->get_error_message());
-            }
-        }
-        // Không gọi API ảnh đồng bộ ở đây. Bài viết được lưu ngay; featured/inline
-        // image workers tiếp tục độc lập bằng WP-Cron.
-        $image_warning = $this->inline_images_enabled()
-            ? 'Bài viết đã lưu; ảnh đại diện và ảnh minh họa đang được tạo ở chế độ nền.'
-            : 'Bài viết đã lưu; ảnh đại diện đang được tạo ở chế độ nền.';
+        // Giai đoạn 1 dừng tại đây. Job ảnh chỉ được lưu để dùng sau khi người
+        // dùng kiểm tra bài và bấm “Duyệt nội dung & tạo ảnh”.
+        $image_warning = '';
 
         // 5. Tự động đi liên kết nội bộ (Internal Link)
         $this->set_stage_message('Đang tự động đi liên kết nội bộ' . $this->stage_progress_suffix() . '...');
@@ -1231,7 +1273,8 @@ class Agent_SEO_Orchestrator {
             'success'       => true,
             'post_id'       => $post_id,
             'title'         => $article['seo_title'],
-            'image_warning' => $image_warning
+            'image_warning' => $image_warning,
+            'review_required' => true
         );
     }
 

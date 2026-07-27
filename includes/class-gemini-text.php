@@ -578,8 +578,10 @@ Yêu cầu bắt buộc:
         if (empty($api_key) || empty($website_url)) {
             return array('success' => false, 'message' => 'Thiếu Gemini API Key hoặc địa chỉ website.');
         }
+
+        $website_url = trailingslashit(esc_url_raw($website_url));
         $response = wp_safe_remote_get($website_url, array(
-            'timeout' => 30,
+            'timeout' => 20,
             'redirection' => 5,
             'user-agent' => 'Mozilla/5.0 (compatible; AgentSEO/1.0; +' . home_url('/') . ')'
         ));
@@ -590,11 +592,70 @@ Yêu cầu bắt buộc:
         if ($code !== 200) {
             return array('success' => false, 'message' => 'Website phản hồi HTTP ' . $code . '.');
         }
-        $html = wp_remote_retrieve_body($response);
-        $html = preg_replace('#<(script|style|noscript|svg)[^>]*>.*?</\1>#is', ' ', $html);
-        $text = html_entity_decode(wp_strip_all_tags($html), ENT_QUOTES | ENT_HTML5, 'UTF-8');
-        $text = preg_replace('/\s+/', ' ', trim($text));
-        $text = mb_substr($text, 0, 24000);
+
+        $home_html = wp_remote_retrieve_body($response);
+        $page_html_list = array($home_html);
+
+        // Tự tìm thêm tối đa hai trang có khả năng chứa dữ liệu doanh nghiệp.
+        // Ưu tiên Liên hệ trước Giới thiệu để lấy hotline/địa chỉ chính xác hơn.
+        $base_parts = wp_parse_url($website_url);
+        $base_host = isset($base_parts['host']) ? strtolower($base_parts['host']) : '';
+        $base_host_identity = preg_replace('/^www\./', '', $base_host);
+        $base_scheme = isset($base_parts['scheme']) ? $base_parts['scheme'] : 'https';
+        $base_origin = $base_scheme . '://' . $base_host . (!empty($base_parts['port']) ? ':' . intval($base_parts['port']) : '');
+        $link_groups = array('contact' => array(), 'about' => array());
+        if (preg_match_all('/<a\b[^>]*\bhref\s*=\s*(["\'])(.*?)\1/is', $home_html, $link_matches)) {
+            foreach ($link_matches[2] as $raw_href) {
+                $href = html_entity_decode(trim($raw_href), ENT_QUOTES | ENT_HTML5, 'UTF-8');
+                if ($href === '' || preg_match('~^(?:mailto:|tel:|javascript:|#)~i', $href)) {
+                    continue;
+                }
+                if (strpos($href, '//') === 0) {
+                    $candidate_url = $base_scheme . ':' . $href;
+                } elseif (preg_match('#^https?://#i', $href)) {
+                    $candidate_url = $href;
+                } elseif (strpos($href, '/') === 0) {
+                    $candidate_url = $base_origin . $href;
+                } else {
+                    $candidate_url = trailingslashit($website_url) . ltrim($href, '/');
+                }
+                $candidate_url = strtok($candidate_url, '#');
+                $candidate_parts = wp_parse_url($candidate_url);
+                $candidate_host = isset($candidate_parts['host']) ? strtolower($candidate_parts['host']) : '';
+                if (preg_replace('/^www\./', '', $candidate_host) !== $base_host_identity) {
+                    continue;
+                }
+                $searchable = strtolower(remove_accents($candidate_url));
+                if (preg_match('/(?:lien-he|lienhe|contact|dia-chi|hotline|cua-hang)/', $searchable)) {
+                    $link_groups['contact'][] = esc_url_raw($candidate_url);
+                } elseif (preg_match('/(?:gioi-thieu|gioithieu|about|ve-chung-toi|vechungtoi)/', $searchable)) {
+                    $link_groups['about'][] = esc_url_raw($candidate_url);
+                }
+            }
+        }
+
+        $profile_urls = array_slice(array_values(array_unique(array_merge($link_groups['contact'], $link_groups['about']))), 0, 2);
+        foreach ($profile_urls as $profile_url) {
+            $page_response = wp_safe_remote_get($profile_url, array(
+                'timeout' => 15,
+                'redirection' => 3,
+                'user-agent' => 'Mozilla/5.0 (compatible; AgentSEO/1.0; +' . home_url('/') . ')'
+            ));
+            if (!is_wp_error($page_response) && wp_remote_retrieve_response_code($page_response) === 200) {
+                $page_html_list[] = wp_remote_retrieve_body($page_response);
+            }
+        }
+
+        $page_texts = array();
+        foreach ($page_html_list as $page_html) {
+            $clean_html = preg_replace('#<(script|style|noscript|svg)[^>]*>.*?</\1>#is', ' ', $page_html);
+            $page_text = html_entity_decode(wp_strip_all_tags($clean_html), ENT_QUOTES | ENT_HTML5, 'UTF-8');
+            $page_text = preg_replace('/\s+/', ' ', trim($page_text));
+            if ($page_text !== '') {
+                $page_texts[] = mb_substr($page_text, 0, 12000);
+            }
+        }
+        $text = mb_substr(implode("\n\n--- TRANG LIÊN QUAN ---\n\n", $page_texts), 0, 32000);
         if (mb_strlen($text) < 100) {
             return array('success' => false, 'message' => 'Không đọc được đủ nội dung công khai từ website.');
         }
@@ -619,8 +680,13 @@ Yêu cầu bắt buộc:
         if (is_wp_error($ai_response)) {
             return array('success' => false, 'message' => $ai_response->get_error_message());
         }
+        $ai_code = wp_remote_retrieve_response_code($ai_response);
+        if ($ai_code < 200 || $ai_code >= 300) {
+            return array('success' => false, 'message' => 'Gemini phản hồi HTTP ' . $ai_code . ' khi phân tích website.');
+        }
         $data = json_decode(wp_remote_retrieve_body($ai_response), true);
         $raw = isset($data['candidates'][0]['content']['parts'][0]['text']) ? trim($data['candidates'][0]['content']['parts'][0]['text']) : '';
+        $raw = preg_replace('/^```(?:json)?\s*|\s*```$/i', '', $raw);
         $profile = json_decode($raw, true);
         if (!is_array($profile) || empty($profile['brand_name'])) {
             return array('success' => false, 'message' => 'AI không nhận diện được hồ sơ doanh nghiệp hợp lệ.');

@@ -8,6 +8,14 @@ defined('ABSPATH') || exit;
 class Agent_SEO_Gemini_Image {
 
     /**
+     * Tỷ lệ ảnh dùng chung cho mọi bộ máy sinh ảnh.
+     */
+    private static function configured_aspect_ratio() {
+        $ratio = get_option('aseo_image_aspect_ratio', '16:9');
+        return $ratio === '1:1' ? '1:1' : '16:9';
+    }
+
+    /**
      * Kiểm tra kết nối tới Imagen 4 API bằng cách tạo thử ảnh siêu nhỏ
      */
     public static function test_connection($api_key) {
@@ -70,7 +78,7 @@ class Agent_SEO_Gemini_Image {
             'parameters' => array(
                 'sampleCount'    => 1,
                 'outputMimeType' => 'image/jpeg',
-                'aspectRatio'    => '16:9' // Thường dùng cho ảnh banner/featured bài viết
+                'aspectRatio'    => self::configured_aspect_ratio()
             )
         );
 
@@ -320,9 +328,10 @@ class Agent_SEO_Gemini_Image {
             ? ' PRODUCT REFERENCE IS THE PRIMARY SUBJECT: preserve the exact package shape, label layout and dominant colors from the supplied reference image; show one clearly recognizable package in the foreground occupying about 35-50% of the frame. Background packages must be secondary and consistent. Never replace the reference with generic packaging or bags of another color.'
             : ' If no product reference is supplied, do not invent packaging that is not present in the article context.';
         $lighting_override = $reference_override . ' FINAL HARD RULE: real soft natural daylight, open shade, cool overcast sky, or bright overcast light, cool white balance 6000K-6500K, clean whites and cool gray tones, realistic skin tones and soft physically accurate shadows. ABSOLUTELY NO yellow tint, yellow cast, orange cast, warm white balance, amber cast, golden-hour light, tungsten, amber filter, sepia, warm beige tones, cinematic color grading, glossy studio glow, CGI, 3D render or artificial AI lighting. Unedited documentary photograph from a real camera.';
+        $ratio = self::configured_aspect_ratio();
         $body = array(
             'prompt' => preg_replace('/\s+/', ' ', trim($prompt . $lighting_override)),
-            'aspectRatio' => 'IMAGE_ASPECT_RATIO_LANDSCAPE',
+            'aspectRatio' => $ratio === '1:1' ? 'IMAGE_ASPECT_RATIO_SQUARE' : 'IMAGE_ASPECT_RATIO_LANDSCAPE',
             'modelKey' => $model_key,
             'numOutputs' => 1,
             'provider' => 'google',
@@ -494,10 +503,11 @@ class Agent_SEO_Gemini_Image {
         // Bổ sung các từ khóa kỹ thuật nhiếp ảnh thương mại cao cấp sạch sẽ, ánh sáng ban ngày lạnh sạch
         $enhanced_prompt = $prompt . ', authentic editorial documentary photography in a real-world environment appropriate to the brand, industry and location, scene and camera angle should vary by article topic, natural human activity, if a product reference is supplied preserve its exact package shape and dominant colors as the primary subject, cool-toned 6000K-6500K daylight, accurate white balance, clean whites and cool grays, true-to-life colors, soft non-yellow shadows, no generic packaging of another color, no warm golden-hour light, no yellow or orange cast, no yellow tint, no warm white balance, no amber cast, no golden hour, no warm beige/brown tones, no cinematic color grading, no dramatic advertising lighting, no glossy 3D render, no CGI, no generic AI stock photo, no invented text or logos.';
 
+        $ratio = self::configured_aspect_ratio();
         $body = array(
             'prompt' => $enhanced_prompt,
-            'width'  => 1024,
-            'height' => 1024,
+            'width'  => $ratio === '1:1' ? 1024 : 1344,
+            'height' => $ratio === '1:1' ? 1024 : 768,
             'seed'   => rand(1, 1000000),
             'steps'  => 4
         );
@@ -547,11 +557,16 @@ class Agent_SEO_Gemini_Image {
             return false;
         }
 
+        $ratio = self::configured_aspect_ratio();
+        $ratio_instruction = $ratio === '1:1'
+            ? ' FINAL OUTPUT FORMAT: square 1:1 composition.'
+            : ' FINAL OUTPUT FORMAT: wide landscape 16:9 composition.';
         $response = wp_remote_post($kaggle_url, array(
             'headers' => array('Content-Type' => 'application/json'),
             'body'    => wp_json_encode(array(
-                'prompt'    => $prompt,
-                'image_url' => $image_url
+                'prompt'       => $prompt . $ratio_instruction,
+                'image_url'    => $image_url,
+                'aspect_ratio' => $ratio
             )),
             'timeout' => 210 // Google Flow gồm upload ảnh tham chiếu + sinh ảnh + tải ảnh về
         ));
