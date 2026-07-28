@@ -2037,6 +2037,7 @@ class Agent_SEO_Settings {
                 <div class="aseo-workflow-card">
                 <div class="aseo-brief-chat" id="aseo-brief-chat">
                     <div class="aseo-brief-chat-head"><span aria-hidden="true">🤖</span><h3>Trợ lý tạo bài</h3><span>Viết yêu cầu tự nhiên, AI tự điền brief</span></div>
+                    <div class="aseo-brief-compact-bar aseo-chat-keyword-bar"><label style="display:flex;align-items:center;gap:6px;flex:1;"><strong>Từ khóa chính:</strong><input type="text" class="aseo-brief-compact-keyword-input" id="aseo-brief-compact-keyword" placeholder="Nhập từ khóa chính"></label></div>
                     <textarea id="aseo-brief-chat-input" placeholder="Ví dụ: Viết bài giới thiệu gạo ST25 25kg của Gạo Cần Thơ Kavico, bán tại Cần Thơ, chèn link https://gaocantho.com/..."></textarea>
                     <div class="aseo-brief-chat-actions"><button type="button" class="aseo-btn aseo-btn-save" id="aseo-brief-chat-submit">✨ AI chuẩn bị brief & prompt</button><span class="aseo-brief-chat-status" id="aseo-brief-chat-status" aria-live="polite"></span></div>
                     <?php if (!empty($master_prompt)) : ?><div class="aseo-article-prompt-preview" id="aseo-article-prompt-preview"><strong>Prompt đang áp dụng</strong><code><?php echo esc_html($master_prompt); ?></code></div><?php endif; ?>
@@ -2178,7 +2179,7 @@ class Agent_SEO_Settings {
                         <input type="hidden" name="aseo_article_title_run" id="aseo_article_title_run" value="">
                         <input type="hidden" name="aseo_article_outline_run" id="aseo_article_outline_run" value="">
                         <input type="hidden" name="aseo_article_secondary_run" id="aseo_article_secondary_run" value="">
-                        <div class="aseo-brief-compact-bar"><label style="display:flex;align-items:center;gap:6px;flex:1;"><strong>Từ khóa chính:</strong><input type="text" class="aseo-brief-compact-keyword-input" id="aseo-brief-compact-keyword" placeholder="Nhập từ khóa chính"></label><button type="button" class="aseo-brief-compact-toggle" id="aseo-toggle-brief-fields" aria-expanded="false">Chỉnh sửa brief</button></div>
+                        <div class="aseo-brief-compact-bar"><span>Brief đã được Trợ lý AI tự điền</span><button type="button" class="aseo-brief-compact-toggle" id="aseo-toggle-brief-fields" aria-expanded="false">Chỉnh sửa brief</button></div>
                         <div class="aseo-brief-grid aseo-create-control-wide aseo-brief-fields-collapsed" id="aseo-brief-fields">
                             <label class="aseo-create-control"><span>Chủ đề / keyword *</span><input type="text" id="aseo_article_topic" placeholder="gạo ST25 25kg Cần Thơ" required></label>
                             <label class="aseo-create-control"><span>Khu vực</span><input type="text" id="aseo_article_location" placeholder="Cần Thơ, miền Tây"></label>
@@ -3807,6 +3808,11 @@ class Agent_SEO_Settings {
                 briefChatSubmit.addEventListener('click', function() {
                     var request = briefChatInput.value.trim();
                     if (!request) { briefChatInput.focus(); return; }
+                    var assistantKeyword = document.getElementById('aseo-brief-compact-keyword');
+                    var primaryKeyword = assistantKeyword ? assistantKeyword.value.trim() : '';
+                    if (primaryKeyword) {
+                        request += '\n\nTỪ KHÓA CHÍNH BẮT BUỘC CHO TOÀN BỘ BÀI VIẾT: ' + primaryKeyword;
+                    }
                     briefChatSubmit.disabled = true;
                     briefChatSubmit.textContent = 'AI đang phân tích...';
                     if (briefChatStatus) briefChatStatus.textContent = 'Đang lấy thông tin website và chuẩn bị brief...';
