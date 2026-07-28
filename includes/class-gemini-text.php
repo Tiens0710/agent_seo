@@ -245,7 +245,7 @@ Yêu cầu bài viết để chuẩn E-E-A-T của Google:
 
 7. ĐỊNH DẠNG ĐẦU RA JSON BẮT BUỘC:
    - Chỉ trả về duy nhất một chuỗi JSON chứa các khóa:
-     * \"seo_title\": Tiêu đề SEO tự nhiên, thu hút người đọc, lồng ghép từ khóa chính \"{$keyword}\" một cách sáng tạo và trôi chảy (từ khóa có thể đứng ở đầu, giữa hoặc cuối tùy vào ngữ cảnh để tiêu đề tự nhiên nhất, tránh việc bài nào cũng lặp lại cấu trúc rập khuôn \"Từ khóa chính: ...\"). Nên có chứa số tự nhiên (như 3, 5, 7, hoặc năm hiện tại) và từ ngữ kích thích click để tăng tỷ lệ CTR, độ dài từ 50 đến 65 ký tự.
+     * \"seo_title\": Tiêu đề SEO tự nhiên, thu hút người đọc, lồng ghép từ khóa chính \"{$keyword}\" và PHẢI phản ánh trực tiếp chủ đề riêng \"{$article_topic}\". Không được đặt tiêu đề chung chung chỉ xoay quanh từ khóa chính. Chỉ dùng số đếm (ví dụ \"4 cách\", \"5 tiêu chí\", \"3 bước\") khi phần content thực sự có đủ đúng số mục riêng biệt tương ứng; nếu không chắc chắn thì không dùng số. Độ dài từ 50 đến 65 ký tự.
      * \"slug\": Đường dẫn tĩnh viết thường, không dấu, ngăn cách bằng dấu gạch ngang. Slug bắt buộc phản ánh góc nội dung/chủ đề phụ riêng của bài, không được chỉ lặp lại từ khóa chính dùng chung và không được thêm hậu tố số như -2, -3.
      * \"meta_description\": Đoạn mô tả tóm tắt ngắn gọn bài viết (khoảng 2-3 câu, tối đa 160 ký tự) làm thẻ meta description để hiển thị trên Google.
      * \"primary_keyword\": Từ khóa chính tối ưu riêng cho bài viết này (tự động kết hợp tinh tế giữa từ khóa chính chung \"{$keyword}\" và góc nội dung cụ thể \"{$article_topic}\", ví dụ nếu từ khóa chung là \"mua gạo Cần Thơ\" và chủ đề là \"chọn gạo ST25\", bạn có thể tạo từ khóa chính riêng là \"mua gạo ST25 Cần Thơ\"). Từ khóa này sẽ làm từ khóa tập trung (focus keyword) chính của bài viết để tránh bị trùng lặp với các bài viết khác.
@@ -276,6 +276,10 @@ Yêu cầu bài viết để chuẩn E-E-A-T của Google:
         if (!empty($article_topic) && $article_topic !== $keyword) {
             $prompt .= "\n\nARTICLE SUBTOPIC FOR THIS SPECIFIC ARTICLE: \"{$article_topic}\". Use this as the unique angle and supporting topic while keeping \"{$keyword}\" as the only primary keyword for the whole content cluster. Include several natural secondary/LSI phrases related to this subtopic, but do not replace the primary keyword.\n";
             $prompt .= "SLUG UNIQUENESS: Build the slug from this specific article subtopic and its unique search intent. Never return a slug based only on the shared primary keyword.\n";
+        }
+        if (!empty($article_topic)) {
+            $prompt .= "\nTITLE-CONTENT MATCH — HIGHEST PRIORITY: The exact article topic is \"{$article_topic}\". The seo_title MUST clearly name or describe this specific topic, not merely the broad primary keyword \"{$keyword}\". The opening, H2/H3 headings, examples and CTA must all serve this same topic. Before returning JSON, verify that a reader can predict the article's actual subject from the seo_title alone.\n";
+            $prompt .= "NUMBERED PROMISE RULE: If the seo_title promises N items (for example \"4 cách\", \"5 lỗi\", \"7 bước\"), create exactly N clearly separated and visibly numbered items in the content. Each item must contain its own useful explanation, not a repeated or empty heading. Never promise 4 items and provide 3, 5 items and provide 4, or use a number only as clickbait.\n";
         }
         $prompt .= "\nSECONDARY KEYWORDS: In the JSON field secondary_keyword, return only 3-5 comma-separated secondary/LSI phrases most relevant to this article's subtopic. Use them naturally in the content; the primary keyword remains only \"{$keyword}\".\n";
         if (!empty($global_secondary_keywords)) {
@@ -401,6 +405,13 @@ Yêu cầu bài viết để chuẩn E-E-A-T của Google:
             return array('success' => false, 'message' => 'Dữ liệu bài viết trả về bị thiếu trường seo_title hoặc content.');
         }
 
+        // Bảo vệ cuối cho trường hợp AI tạo tiêu đề quá rộng, không đúng chủ đề riêng.
+        // Khi không đủ dấu hiệu chủ đề trong tiêu đề, dùng chính chủ đề làm tiêu đề
+        // thay vì lưu một bài có title và content lệch nhau.
+        if (!empty($article_topic) && !self::title_matches_article_topic($article['seo_title'], $article_topic)) {
+            $article['seo_title'] = self::build_topic_title($article_topic);
+        }
+
         // Một số phản hồi vẫn ngắn hơn yêu cầu dù prompt đã nêu rõ độ dài.
         // Chỉ gọi thêm một lần khi bài thực sự thiếu dung lượng, tránh làm chậm các bài đạt chuẩn.
         $word_count = 0;
@@ -446,6 +457,41 @@ Yêu cầu bài viết để chuẩn E-E-A-T của Google:
             'content'          => $article['content'], // Giữ nguyên HTML
             'image_prompt'     => sanitize_text_field($article['image_prompt'])
         );
+    }
+
+    private static function title_matches_article_topic($title, $topic) {
+        $normalize = static function($value) {
+            $value = strtolower(remove_accents(wp_strip_all_tags((string) $value)));
+            $value = preg_replace('/[^a-z0-9\s]+/', ' ', $value);
+            return preg_split('/\s+/', trim($value), -1, PREG_SPLIT_NO_EMPTY);
+        };
+
+        $topic_words = $normalize($topic);
+        $title_words = array_flip($normalize($title));
+        $stop_words = array_flip(array('va', 'voi', 'cho', 'cua', 'cac', 'nhung', 'mot', 'tu', 'den', 'tai', 'theo', 'nhu', 'la', 'co', 'de', 'trong'));
+        $meaningful_topic_words = array_values(array_filter($topic_words, static function($word) use ($stop_words) {
+            return mb_strlen($word) >= 3 && !isset($stop_words[$word]);
+        }));
+        if (empty($meaningful_topic_words)) {
+            return true;
+        }
+
+        $matched = 0;
+        foreach (array_unique($meaningful_topic_words) as $word) {
+            if (isset($title_words[$word])) {
+                $matched++;
+            }
+        }
+        $required = count($meaningful_topic_words) === 1 ? 1 : min(2, count($meaningful_topic_words));
+        return $matched >= $required;
+    }
+
+    private static function build_topic_title($topic) {
+        $topic = trim(sanitize_text_field($topic));
+        if (mb_strlen($topic) <= 65) {
+            return $topic;
+        }
+        return rtrim(mb_substr($topic, 0, 62)) . '...';
     }
 
     private static function enforce_contact_and_backlink($content, $brand_data, $backlink_url = '') {
