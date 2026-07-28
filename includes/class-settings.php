@@ -16,6 +16,9 @@ class Agent_SEO_Settings {
         add_action('wp_ajax_agent_seo_save_product', array($this, 'ajax_save_product'));
         add_action('wp_ajax_agent_seo_autosave_setting', array($this, 'ajax_autosave_setting'));
         add_action('wp_ajax_agent_seo_retry_image', array($this, 'ajax_retry_image'));
+        add_action('wp_ajax_agent_seo_accept_image', array($this, 'ajax_accept_image'));
+        add_action('wp_ajax_agent_seo_preview_post', array($this, 'ajax_preview_post'));
+        add_action('wp_ajax_agent_seo_image_status', array($this, 'ajax_image_status'));
         add_action('wp_ajax_agent_seo_stop_batch', array($this, 'ajax_stop_batch'));
         add_action('wp_ajax_agent_seo_parse_brief', array($this, 'ajax_parse_brief'));
         add_action('wp_ajax_agent_seo_prepare_assistant', array($this, 'ajax_prepare_assistant'));
@@ -96,6 +99,35 @@ class Agent_SEO_Settings {
         if ($brief === '' || $api_key === '') {
             wp_send_json_error(array('message' => $brief === '' ? 'Hãy nhập yêu cầu trước.' : 'Chưa cấu hình Gemini API Key.'));
         }
+
+        // Mỗi lần người dùng bấm trợ lý, làm mới hồ sơ doanh nghiệp từ website
+        // trước khi tạo brief/prompt để nội dung luôn dùng thông tin mới nhất.
+        $website_url = trailingslashit(home_url('/'));
+        $profile = Agent_SEO_Gemini_Text::extract_website_profile($api_key, $website_url);
+        if (!empty($profile['success'])) {
+            $brand_price = trim(
+                (isset($profile['product_summary']) ? $profile['product_summary'] : '')
+                . (!empty($profile['brand_price']) ? ' Giá công khai: ' . $profile['brand_price'] : '')
+            );
+            $profile_map = array(
+                'aseo_source_website' => $website_url,
+                'aseo_brand_name' => isset($profile['brand_name']) ? $profile['brand_name'] : '',
+                'aseo_brand_address' => isset($profile['brand_address']) ? $profile['brand_address'] : '',
+                'aseo_brand_phone' => isset($profile['brand_phone']) ? $profile['brand_phone'] : '',
+                'aseo_brand_contact' => isset($profile['brand_contact']) ? $profile['brand_contact'] : '',
+                'aseo_brand_price' => $brand_price,
+                'aseo_brand_cta' => isset($profile['brand_cta']) ? $profile['brand_cta'] : '',
+                'aseo_niche' => isset($profile['niche']) ? $profile['niche'] : '',
+                'aseo_brand_voice' => isset($profile['brand_voice']) ? $profile['brand_voice'] : ''
+            );
+            foreach ($profile_map as $profile_option => $profile_value) {
+                if ($profile_option !== 'aseo_source_website' && trim((string) $profile_value) === '') {
+                    $profile_map[$profile_option] = get_option($profile_option, '');
+                }
+                update_option($profile_option, $profile_map[$profile_option]);
+            }
+            update_option('aseo_company_profile_auto_done', time(), false);
+        }
         $parsed = Agent_SEO_Gemini_Text::parse_article_brief($api_key, $brief);
         if (empty($parsed['success'])) {
             wp_send_json_error(array('message' => $parsed['message']));
@@ -116,7 +148,11 @@ class Agent_SEO_Settings {
         update_option('aseo_master_prompt', $prompt_result['master_prompt']);
         update_option('aseo_master_text_prompt', $prompt_result['master_prompt']);
         update_option('aseo_master_image_prompt', $prompt_result['master_prompt']);
-        wp_send_json_success(array('brief' => $parsed['brief'], 'master_prompt' => $prompt_result['master_prompt']));
+        wp_send_json_success(array(
+            'brief' => $parsed['brief'],
+            'master_prompt' => $prompt_result['master_prompt'],
+            'company_profile_refreshed' => !empty($profile['success'])
+        ));
     }
 
     public function ajax_parse_brief() {
@@ -338,7 +374,8 @@ class Agent_SEO_Settings {
             update_post_meta($post_id, '_agent_seo_inline_image_ids', array());
         }
         delete_post_meta($post_id, '_agent_seo_awaiting_image_approval');
-        update_post_meta($post_id, '_agent_seo_image_approved', '1');
+        // Mỗi ảnh mới hoặc ảnh sửa lại đều phải được người dùng chấp nhận.
+        update_post_meta($post_id, '_agent_seo_image_approved', '0');
         update_post_meta($post_id, '_agent_seo_force_image_retry', '1');
         if ($current_thumbnail_id) {
             // Người dùng đã yêu cầu tạo lại: xóa thumbnail hiện tại để worker
@@ -383,7 +420,7 @@ class Agent_SEO_Settings {
                 $pending_images[] = $post_id;
                 $batch['pending_images'] = array_values(array_unique(array_filter(array_map('absint', $pending_images))));
                 $batch['status'] = 'images_pending';
-                $batch['message'] = 'Nội dung đã được duyệt. Đang tạo ảnh cho bài “' . sanitize_text_field($post->post_title) . '”...';
+                $batch['message'] = 'Đang tạo ảnh cho bài “' . sanitize_text_field($post->post_title) . '”...';
                 $batch['updated_at'] = time();
                 unset($batch['finished_at']);
                 update_option('aseo_batch_status', $batch, false);
@@ -391,13 +428,118 @@ class Agent_SEO_Settings {
         }
         wp_send_json_success(array(
             'message' => $was_awaiting_approval
-                ? 'Đã duyệt nội dung và bắt đầu tạo ảnh.'
+                ? 'Đã xếp hàng tạo ảnh cho bài đã chọn.'
                 : ($is_edit_request
                     ? 'Đã nhận prompt sửa ảnh và bắt đầu tạo phiên bản mới.'
                     : 'Đã xếp hàng tạo lại ảnh. Hệ thống sẽ cập nhật sau khi hoàn tất.'),
             'queued' => true
         ));
 
+    }
+
+    public function ajax_accept_image() {
+        if (!current_user_can('manage_options')) {
+            wp_send_json_error(array('message' => 'Không có quyền truy cập.'), 403);
+        }
+        check_ajax_referer('agent_seo_accept_image', 'nonce');
+
+        $post_id = isset($_POST['post_id']) ? absint($_POST['post_id']) : 0;
+        $post = $post_id > 0 ? get_post($post_id) : null;
+        if (!$post || $post->post_type !== 'post') {
+            wp_send_json_error(array('message' => 'Bài viết không hợp lệ.'), 400);
+        }
+        if (!get_post_thumbnail_id($post_id)) {
+            wp_send_json_error(array('message' => 'Ảnh đại diện chưa tạo xong.'), 409);
+        }
+
+        update_post_meta($post_id, '_agent_seo_image_approved', '1');
+        delete_post_meta($post_id, '_agent_seo_awaiting_image_approval');
+
+        $inline_ready = true;
+        if (get_option('aseo_enable_inline_images', '0') === '1') {
+            $inline_ids = get_post_meta($post_id, '_agent_seo_inline_image_ids', true);
+            $inline_ids = is_array($inline_ids) ? array_filter(array_map('absint', $inline_ids)) : array();
+            $inline_ready = count($inline_ids) >= 1;
+        }
+        $published = false;
+        if ($inline_ready) {
+            update_post_meta($post_id, '_agent_seo_image_stage_complete', '1');
+            if (get_post_meta($post_id, '_agent_seo_publish_after_images', true) === '1' && $post->post_status !== 'publish') {
+                $updated = wp_update_post(array('ID' => $post_id, 'post_status' => 'publish'), true);
+                if (is_wp_error($updated)) {
+                    wp_send_json_error(array('message' => 'Đã chấp nhận ảnh nhưng chưa thể xuất bản bài viết: ' . $updated->get_error_message()), 500);
+                }
+                $published = true;
+            }
+        }
+
+        wp_send_json_success(array(
+            'message' => $published
+                ? 'Đã chấp nhận ảnh và xuất bản bài viết.'
+                : ($inline_ready ? 'Đã chấp nhận ảnh.' : 'Đã chấp nhận ảnh đại diện; hệ thống đang hoàn thiện ảnh phụ.'),
+            'published' => $published
+        ));
+    }
+
+    public function ajax_preview_post() {
+        if (!current_user_can('manage_options')) {
+            wp_send_json_error(array('message' => 'Không có quyền truy cập.'), 403);
+        }
+        check_ajax_referer('agent_seo_preview_post', 'nonce');
+
+        $post_id = isset($_POST['post_id']) ? absint($_POST['post_id']) : 0;
+        $post = $post_id > 0 ? get_post($post_id) : null;
+        if (!$post || $post->post_type !== 'post') {
+            wp_send_json_error(array('message' => 'Không tìm thấy bài viết.'), 404);
+        }
+
+        wp_send_json_success(array(
+            'title' => $post->post_title,
+            'content' => wp_kses_post(apply_filters('the_content', $post->post_content)),
+            'edit_url' => get_edit_post_link($post_id, 'raw'),
+            'view_url' => $post->post_status === 'publish'
+                ? get_permalink($post_id)
+                : get_preview_post_link($post_id)
+        ));
+    }
+
+    public function ajax_image_status() {
+        if (!current_user_can('manage_options')) {
+            wp_send_json_error(array('message' => 'Không có quyền truy cập.'), 403);
+        }
+        check_ajax_referer('agent_seo_image_status', 'nonce');
+
+        $post_id = isset($_POST['post_id']) ? absint($_POST['post_id']) : 0;
+        $post = $post_id > 0 ? get_post($post_id) : null;
+        if (!$post || $post->post_type !== 'post') {
+            wp_send_json_error(array('message' => 'Bài viết không hợp lệ.'), 404);
+        }
+
+        $featured_id = absint(get_post_thumbnail_id($post_id));
+        $approved = get_post_meta($post_id, '_agent_seo_image_approved', true) === '1';
+        $waiting = get_post_meta($post_id, '_agent_seo_awaiting_image_approval', true) === '1';
+        $job = get_post_meta($post_id, '_agent_seo_image_job', true);
+        $has_job = is_array($job) && !empty($job['prompt']);
+
+        if ($featured_id > 0) {
+            $status = $approved ? 'done' : 'review';
+        } elseif ($waiting) {
+            $status = 'waiting';
+        } elseif ($has_job || wp_next_scheduled('agent_seo_image_retry_task', array($post_id))) {
+            $status = 'running';
+        } else {
+            $status = 'failed';
+        }
+
+        wp_send_json_success(array(
+            'status' => $status,
+            'thumb_url' => $featured_id ? wp_get_attachment_image_url($featured_id, 'medium') : '',
+            'message' => $status === 'running'
+                ? 'Ảnh vẫn đang được tạo…'
+                : ($status === 'review'
+                    ? 'Ảnh mới đã hoàn tất và đang chờ chấp nhận.'
+                    : ($status === 'failed' ? 'Không tạo được ảnh. Bạn có thể bấm tạo lại.' : ''))
+        ));
     }
 
     public function ajax_batch_status() {
@@ -458,8 +600,7 @@ class Agent_SEO_Settings {
                     if (!get_post($pending_post_id)) {
                         continue;
                     }
-                    // Giai đoạn 1 chỉ tạo nội dung. Không tự đánh thức job ảnh
-                    // của bài vẫn đang chờ người dùng duyệt.
+                    // Chỉ chạy ảnh sau khi người dùng bấm “Tạo ảnh”.
                     if (get_post_meta($pending_post_id, '_agent_seo_awaiting_image_approval', true) === '1') {
                         continue;
                     }
@@ -1094,6 +1235,12 @@ class Agent_SEO_Settings {
             .aseo-brief-grid input, .aseo-brief-grid select, .aseo-brief-grid textarea { width:100%; min-height:46px; border:1px solid #b9cfc1; border-radius:9px; padding:10px 12px; background:#fff; color:#17251d; font-size:.88rem; }
             .aseo-brief-grid textarea { min-height:70px; resize:vertical; }
             .aseo-brief-grid label span { font-size:.78rem; font-weight:800; color:#365347; }
+            .aseo-brief-compact-bar { display:flex; align-items:center; justify-content:space-between; gap:12px; margin:0 0 12px; padding:10px 12px; border:1px solid #dbe7df; border-radius:9px; background:#f8faf9; color:#64748b; font-size:.78rem; }
+            .aseo-brief-compact-bar strong { color:#365347; }
+            .aseo-brief-compact-keyword-input { flex:1; min-width:160px; border:0; border-bottom:1px solid #b9cfc1; background:transparent; color:#17251d; font-size:.82rem; font-weight:700; padding:4px 5px; outline:none; }
+            .aseo-brief-compact-keyword-input:focus { border-bottom-color:#16834b; box-shadow:0 1px 0 #16834b; }
+            .aseo-brief-compact-toggle { flex:0 0 auto; border:0; background:transparent; color:#166534; font-size:.76rem; font-weight:800; cursor:pointer; text-decoration:underline; }
+            .aseo-create-form .aseo-brief-grid.aseo-brief-fields-collapsed { display:none; }
             .aseo-outline-preview { display:none; margin:14px 0; padding:14px 16px; border:1px solid #cfe3d6; border-radius:10px; background:#fbfefc; }
             .aseo-outline-preview.is-visible { display:block; }
             .aseo-outline-preview strong { color:#0a1f14; }
@@ -1136,6 +1283,67 @@ class Agent_SEO_Settings {
             .aseo-stage-queue-summary .is-review { border-color:#efd58b; background:#fff7d6; color:#92400e; }
             .aseo-stage-queue-summary .is-running { border-color:#bfdbfe; background:#eff6ff; color:#1d4ed8; }
             .aseo-stage-queue-summary .is-done { border-color:#bbf7d0; background:#f0fdf4; color:#166534; }
+            .aseo-bulk-image-actions { display:flex; align-items:center; gap:10px; flex-wrap:wrap; margin:0 0 12px; }
+            .aseo-bulk-image-actions .button#aseo-generate-all-images { min-height:42px; height:auto; padding:9px 17px; border:0; border-radius:10px; background:linear-gradient(135deg,#0f7a43,#16834b 55%,#2b9b63); box-shadow:0 6px 14px rgba(15,122,67,.2); color:#fff; font-size:.82rem; font-weight:800; letter-spacing:.01em; transition:transform .18s ease,box-shadow .18s ease,filter .18s ease; }
+            .aseo-bulk-image-actions .button#aseo-generate-all-images:hover { background:linear-gradient(135deg,#0b6638,#116f40 55%,#238653); box-shadow:0 8px 18px rgba(15,122,67,.28); color:#fff; transform:translateY(-1px); filter:saturate(1.08); }
+            .aseo-bulk-image-actions .button#aseo-generate-all-images:disabled { background:linear-gradient(135deg,#94a3b8,#64748b); box-shadow:none; cursor:wait; transform:none; }
+            .aseo-bulk-image-actions span { color:#64748b; font-size:.74rem; }
+            .aseo-stage-article-nav { display:flex; align-items:center; gap:10px; margin:0 0 12px; padding:10px 12px; border:1px solid #e2e8f0; border-radius:10px; background:#fff; overflow:hidden; }
+            .aseo-stage-article-nav > strong { flex:0 0 auto; color:#334155; font-size:.76rem; }
+            .aseo-stage-article-links { display:flex; gap:7px; min-width:0; overflow-x:auto; padding-bottom:2px; }
+            .aseo-stage-article-links a { display:block; flex:0 0 auto; max-width:260px; padding:6px 10px; border-radius:7px; background:#f1f5f9; color:#334155; font-size:.73rem; font-weight:700; text-decoration:none; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+            .aseo-stage-article-links a:hover { background:#e2e8f0; color:#0f5132; }
+            .aseo-stage-article-list { display:grid; gap:8px; margin:0 0 14px; }
+            .aseo-stage-article-row { display:grid; grid-template-columns:42px minmax(0,1fr) auto; align-items:center; gap:11px; padding:10px 11px; border:1px solid #dbe7df; border-radius:10px; background:#fff; }
+            .aseo-stage-article-row.is-generating { border-color:#bfdbfe; background:linear-gradient(90deg,#fff,#f8fbff,#fff); background-size:220% 100%; animation:aseoGeneratingRow 2.4s ease-in-out infinite; }
+            .aseo-stage-article-row-thumb { display:flex; align-items:center; justify-content:center; width:42px; height:36px; overflow:hidden; border-radius:7px; background:#f1f5f9; color:#64748b; font-size:.7rem; font-weight:800; }
+            .aseo-stage-article-row.is-generating .aseo-stage-article-row-thumb { position:relative; color:transparent; background:#eaf2ff; }
+            .aseo-stage-article-row.is-generating .aseo-stage-article-row-thumb::after { content:''; position:absolute; inset:0; transform:translateX(-120%); background:linear-gradient(100deg,transparent,rgba(255,255,255,.9),transparent); animation:aseoImageShimmer 1.35s linear infinite; }
+            .aseo-stage-article-row-thumb img { width:100%; height:100%; object-fit:cover; }
+            .aseo-stage-article-row-copy { min-width:0; }
+            .aseo-stage-article-row-copy strong { display:block; color:#17251d; font-size:.8rem; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+            .aseo-stage-article-row-copy span { display:block; margin-top:3px; color:#64748b; font-size:.7rem; }
+            .aseo-stage-article-row-actions { display:flex; align-items:center; gap:7px; }
+            .aseo-stage-article-row-actions .button { display:inline-flex; align-items:center; justify-content:center; min-height:32px; height:auto; padding:5px 10px; line-height:1.2; white-space:nowrap; }
+            .aseo-stage-article-row.is-generating .aseo-image-work-status.is-running::before { content:''; display:inline-block; width:11px; height:11px; margin-right:6px; border:2px solid #bfdbfe; border-top-color:#2563eb; border-radius:50%; animation:aseoSpin .75s linear infinite; }
+            .aseo-stage-article-row.is-generating .aseo-stage-article-row-actions button[disabled]::before { content:''; display:inline-block; width:11px; height:11px; margin-right:6px; border:2px solid #cbd5e1; border-top-color:#2563eb; border-radius:50%; animation:aseoSpin .75s linear infinite; }
+            @keyframes aseoGeneratingRow { 0%,100% { background-position:0 0; box-shadow:0 0 0 rgba(37,99,235,0); } 50% { background-position:100% 0; box-shadow:0 0 0 3px rgba(37,99,235,.06); } }
+            @keyframes aseoImageShimmer { 100% { transform:translateX(120%); } }
+            @keyframes aseoReviewImagePulse { 0%,100% { opacity:.68; } 50% { opacity:.42; } }
+            @media (prefers-reduced-motion:reduce) {
+                .aseo-stage-article-row.is-generating,
+                .aseo-stage-article-row.is-generating .aseo-stage-article-row-thumb::after,
+                .aseo-stage-article-row.is-generating .aseo-image-work-status.is-running::before,
+                .aseo-stage-article-row.is-generating .aseo-stage-article-row-actions button[disabled]::before { animation:none; }
+                .aseo-image-review-card.is-generating .aseo-image-review-visual { animation:none; }
+            }
+            .aseo-article-modal { position:fixed; inset:0; z-index:100000; display:none; align-items:center; justify-content:center; padding:24px; }
+            .aseo-article-modal.is-open { display:flex; }
+            .aseo-article-modal-backdrop { position:absolute; inset:0; background:rgba(15,23,42,.62); backdrop-filter:blur(2px); }
+            .aseo-article-modal-dialog { position:relative; display:flex; flex-direction:column; width:min(960px,96vw); max-height:90vh; overflow:hidden; border:1px solid #dbe7df; border-radius:16px; background:#fff; box-shadow:0 28px 80px rgba(15,23,42,.28); }
+            .aseo-article-modal-head { display:flex; align-items:flex-start; justify-content:space-between; gap:16px; padding:17px 20px; border-bottom:1px solid #e2e8f0; background:#f8faf9; }
+            .aseo-article-modal-head h3 { margin:0; color:#17251d; font-size:1.08rem; line-height:1.4; }
+            .aseo-article-modal-close { flex:0 0 34px; width:34px; height:34px; padding:0; border:0; border-radius:50%; background:#e2e8f0; color:#334155; font-size:22px; line-height:1; cursor:pointer; }
+            .aseo-article-modal-close:hover { background:#cbd5e1; }
+            .aseo-article-modal-body { min-height:220px; overflow:auto; padding:22px 28px; color:#334155; font-size:.9rem; line-height:1.7; }
+            .aseo-article-modal-body h2 { margin:22px 0 9px; color:#17251d; font-size:1.25rem; }
+            .aseo-article-modal-body h3 { margin:18px 0 8px; color:#284638; font-size:1.08rem; }
+            .aseo-article-modal-body img { max-width:100%; height:auto; }
+            .aseo-article-modal-loading { display:flex; align-items:center; justify-content:center; min-height:180px; color:#64748b; }
+            .aseo-article-modal-foot { display:flex; justify-content:flex-end; gap:9px; padding:13px 20px; border-top:1px solid #e2e8f0; background:#f8faf9; }
+            body.aseo-modal-open { overflow:hidden; }
+            .aseo-image-review-card { display:grid; grid-template-columns:minmax(280px,440px) minmax(280px,1fr); gap:20px; padding:18px; border:1.5px solid #b9cfc1; border-radius:13px; background:#fff; box-shadow:0 8px 24px rgba(15,81,50,.06); }
+            .aseo-image-review-card.is-generating { border-color:#bfdbfe; box-shadow:0 0 0 3px rgba(37,99,235,.06); }
+            .aseo-image-review-card.is-generating .aseo-image-review-visual { opacity:.68; animation:aseoReviewImagePulse 1.6s ease-in-out infinite; }
+            .aseo-image-review-visual img { display:block; width:100%; max-height:330px; object-fit:contain; border:1px solid #e2e8f0; border-radius:11px; background:#f8faf9; }
+            .aseo-image-review-info { display:flex; flex-direction:column; justify-content:center; min-width:0; }
+            .aseo-image-review-info h4 { margin:0 0 8px; color:#17251d; font-size:1rem; line-height:1.4; }
+            .aseo-image-review-info p { margin:8px 0 14px; color:#64748b; font-size:.78rem; }
+            .aseo-image-review-actions { display:grid; gap:9px; }
+            .aseo-image-review-actions textarea { width:100%; min-height:74px; padding:8px 9px; border:1px solid #b9cfc1; border-radius:8px; resize:vertical; font-size:.76rem; line-height:1.4; }
+            .aseo-image-review-actions .button { display:flex; align-items:center; justify-content:center; width:100%; height:auto; min-height:40px; padding:8px 10px; text-align:center; white-space:normal; }
+            .aseo-image-action-feedback { display:block; min-height:18px; color:#64748b; font-size:.73rem; text-align:center; }
+            .aseo-accept-image { background:#0f7a43 !important; border-color:#0f7a43 !important; color:#fff !important; }
             .aseo-image-work-card { display:grid; grid-template-columns:110px minmax(0,1fr) minmax(240px,320px); align-items:center; gap:16px; padding:14px; border:1px solid #dbe7df; border-radius:13px; background:#fff; }
             .aseo-image-work-card-focus { border-color:#b9cfc1; box-shadow:0 8px 24px rgba(15,81,50,.06); }
             .aseo-image-work-thumb { width:110px; height:90px; object-fit:contain; border:1px solid #e2e8f0; border-radius:10px; background:#f8faf9; }
@@ -1168,6 +1376,16 @@ class Agent_SEO_Settings {
                 .aseo-draft-review-actions { grid-template-columns:1fr; }
                 .aseo-image-stage-head { flex-direction:column; }
                 .aseo-image-stage-tools { width:100%; justify-content:flex-start; }
+                .aseo-image-review-card { grid-template-columns:1fr; }
+                .aseo-image-review-visual img { max-height:260px; }
+                .aseo-stage-article-nav { align-items:flex-start; flex-direction:column; }
+                .aseo-stage-article-links { width:100%; }
+                .aseo-stage-article-row { grid-template-columns:42px minmax(0,1fr); }
+                .aseo-stage-article-row-actions { grid-column:1 / -1; }
+                .aseo-stage-article-row-actions .button { flex:1; white-space:normal; }
+                .aseo-article-modal { padding:10px; }
+                .aseo-article-modal-dialog { width:100%; max-height:94vh; }
+                .aseo-article-modal-body { padding:17px; }
             }
             .aseo-article-prompt-preview { margin-top:12px; padding:12px 14px; border:1px solid #cfe3d6; border-radius:10px; background:#fbfefc; color:#365347; font-size:.8rem; line-height:1.5; }
             .aseo-article-prompt-preview strong { color:#0a1f14; display:block; margin-bottom:5px; }
@@ -1196,6 +1414,15 @@ class Agent_SEO_Settings {
             .aseo-workflow-card .aseo-chat-message { max-width:92%; }
             .aseo-workflow-card .aseo-chat-builder .aseo-master-brief { min-height:140px; }
             .aseo-workflow-card .aseo-chat-builder { padding:24px; }
+            /* Chế độ tối giản: giữ thao tác chính, ẩn các câu mô tả lặp lại. */
+            .aseo-workflow-card .aseo-section-header > p,
+            .aseo-workflow-card .aseo-image-stage-head > div > p,
+            .aseo-workflow-card .aseo-two-stage-title > span,
+            .aseo-workflow-card .aseo-wizard-intro,
+            .aseo-workflow-card .aseo-guide,
+            .aseo-workflow-card .aseo-stage-copy > span { display:none !important; }
+            .aseo-workflow-card .aseo-two-stage-title { margin-bottom:8px; }
+            .aseo-workflow-card .aseo-image-stage-head { margin-bottom:9px; }
             .aseo-wizard-actions { display:flex; align-items:center; gap:10px; flex-wrap:wrap; }
             .aseo-wizard-next { background:#eaf8ef; color:#166534; border:1px solid #9bc7aa; }
             .aseo-wizard-next:hover { background:#dcfce7; color:#166534; }
@@ -1675,31 +1902,28 @@ class Agent_SEO_Settings {
                 </div>
                 <?php
                 $stage_batch_state = isset($batch_status['status']) ? $batch_status['status'] : 'idle';
-                $stage_review_count = !empty($batch_status['review_required_posts']) && is_array($batch_status['review_required_posts'])
-                    ? count($batch_status['review_required_posts'])
-                    : 0;
                 $stage_one_active = in_array($stage_batch_state, array('queued', 'running', 'waiting'), true);
-                $stage_two_active = $stage_batch_state === 'images_pending';
+                $stage_two_active = in_array($stage_batch_state, array('images_pending', 'complete'), true);
                 ?>
                 <div class="aseo-two-stage-flow" id="aseo-two-stage-flow">
                     <div class="aseo-two-stage-title">
-                        <strong>Quy trình kiểm tra trước khi tạo ảnh</strong>
-                        <span>Nội dung và hình ảnh chạy tách biệt</span>
+                        <strong>Quy trình tạo nội dung rồi chọn tạo ảnh</strong>
+                        <span>API ảnh chỉ chạy khi bạn bấm nút</span>
                     </div>
                     <div class="aseo-two-stage-grid">
                         <a class="aseo-stage-card <?php echo $stage_one_active ? 'is-active' : ''; ?>" href="#aseo-create-section">
                             <span class="aseo-stage-number">1</span>
                             <span class="aseo-stage-copy">
-                                <strong>Tạo và kiểm tra nội dung</strong>
-                                <span>AI chỉ viết bài và lưu bản nháp. Chưa gọi API tạo ảnh.</span>
+                                <strong>Tạo bài viết</strong>
+                                <span>AI viết nội dung và lưu thành danh sách bản nháp.</span>
                             </span>
                         </a>
                         <span class="aseo-stage-arrow" aria-hidden="true">→</span>
-                        <a class="aseo-stage-card <?php echo $stage_two_active ? 'is-active' : ($stage_review_count > 0 ? 'is-ready' : ''); ?>" href="#aseo-image-stage">
+                        <a class="aseo-stage-card <?php echo $stage_two_active ? 'is-active' : ''; ?>" href="#aseo-image-stage">
                             <span class="aseo-stage-number">2</span>
                             <span class="aseo-stage-copy">
-                                <strong>Duyệt nội dung và tạo ảnh</strong>
-                                <span><?php echo $stage_review_count > 0 ? esc_html($stage_review_count . ' bài đang chờ bạn duyệt.') : 'Kiểm tra bản nháp, sau đó bấm duyệt để bắt đầu tạo ảnh.'; ?></span>
+                                <strong>Chọn bài và tạo ảnh</strong>
+                                <span>Bấm tạo ảnh cho bài muốn xử lý, sau đó chấp nhận hoặc sửa.</span>
                             </span>
                         </a>
                     </div>
@@ -1767,10 +1991,6 @@ class Agent_SEO_Settings {
                 if ($batch_state === 'images_pending') $batch_percent = 95;
                 $batch_active = in_array($batch_state, array('queued', 'running', 'waiting', 'images_pending'), true);
                 $batch_visible = in_array($batch_state, array('queued', 'running', 'waiting', 'images_pending', 'complete', 'failed', 'stopped'), true);
-                $batch_review_count = !empty($batch_status['review_required_posts']) && is_array($batch_status['review_required_posts'])
-                    ? count($batch_status['review_required_posts'])
-                    : 0;
-                
                 $batch_started_at = intval(isset($batch_status['started_at']) ? $batch_status['started_at'] : 0);
                 $batch_finished_at = intval(isset($batch_status['finished_at']) ? $batch_status['finished_at'] : 0);
                 $initial_elapsed = 0;
@@ -1785,7 +2005,7 @@ class Agent_SEO_Settings {
                 ?>
                 <div id="aseo-progress-card" class="aseo-progress-card <?php echo $batch_visible ? 'visible ' . esc_attr($batch_state) : ''; ?>" data-started="<?php echo esc_attr($batch_started_at); ?>" data-finished="<?php echo esc_attr($batch_finished_at); ?>">
                     <div class="aseo-progress-head">
-                        <div class="aseo-progress-title"><span class="aseo-spinner"></span><span id="aseo-progress-label"><?php echo $batch_state === 'complete' && $batch_review_count > 0 ? 'Nội dung đã sẵn sàng để duyệt' : ($batch_state === 'complete' ? 'Hoàn tất tạo bài' : ($batch_state === 'stopped' ? 'Đã dừng tiến trình' : 'AI đang xử lý bài viết')); ?></span></div>
+                        <div class="aseo-progress-title"><span class="aseo-spinner"></span><span id="aseo-progress-label"><?php echo $batch_state === 'complete' ? 'Danh sách bài đã sẵn sàng' : ($batch_state === 'stopped' ? 'Đã dừng tiến trình' : 'AI đang xử lý bài viết'); ?></span></div>
                         <div class="aseo-progress-meta">
                             <span id="aseo-progress-timer" class="aseo-progress-timer" title="Thời gian thực hiện">⏱️ <?php echo esc_html($initial_timer_str); ?></span>
                             <div id="aseo-progress-count" class="aseo-progress-count"><?php echo esc_html($batch_completed . '/' . $batch_total . ' bài'); ?></div>
@@ -1817,7 +2037,8 @@ class Agent_SEO_Settings {
                         <input type="hidden" name="aseo_article_title_run" id="aseo_article_title_run" value="">
                         <input type="hidden" name="aseo_article_outline_run" id="aseo_article_outline_run" value="">
                         <input type="hidden" name="aseo_article_secondary_run" id="aseo_article_secondary_run" value="">
-                        <div class="aseo-brief-grid aseo-create-control-wide">
+                        <div class="aseo-brief-compact-bar"><label style="display:flex;align-items:center;gap:6px;flex:1;"><strong>Từ khóa chính:</strong><input type="text" class="aseo-brief-compact-keyword-input" id="aseo-brief-compact-keyword" placeholder="Nhập từ khóa chính"></label><button type="button" class="aseo-brief-compact-toggle" id="aseo-toggle-brief-fields" aria-expanded="false">Chỉnh sửa brief</button></div>
+                        <div class="aseo-brief-grid aseo-create-control-wide aseo-brief-fields-collapsed" id="aseo-brief-fields">
                             <label class="aseo-create-control"><span>Chủ đề / keyword *</span><input type="text" id="aseo_article_topic" placeholder="gạo ST25 25kg Cần Thơ" required></label>
                             <label class="aseo-create-control"><span>Khu vực</span><input type="text" id="aseo_article_location" placeholder="Cần Thơ, miền Tây"></label>
                             <label class="aseo-create-control"><span>Ý định</span><select id="aseo_article_intent"><option value="Tìm hiểu thông tin">Tìm hiểu</option><option value="So sánh và lựa chọn">So sánh</option><option value="Tìm nơi mua / nhận báo giá">Mua / báo giá</option><option value="Hướng dẫn sử dụng">Hướng dẫn</option></select></label>
@@ -1841,15 +2062,15 @@ class Agent_SEO_Settings {
                             <label class="aseo-create-control"><span>Số bài</span>
                             <select name="aseo_num_posts"><option value="1">1 bài</option><option value="2">2 bài</option><option value="3">3 bài</option><option value="5">5 bài</option><option value="10">10 bài</option></select>
                         </label>
-                        <div class="aseo-wizard-actions"><button type="button" id="aseo-preview-brief" class="aseo-btn aseo-wizard-next">2. Xem dàn ý</button><label class="aseo-create-control"><span>Sau khi duyệt và tạo đủ ảnh</span><select name="aseo_post_status_run"><option value="draft" selected>Giữ bản nháp</option><option value="publish">Tự động xuất bản</option></select></label><button type="submit" class="aseo-btn aseo-btn-run">3. Tạo nội dung nháp <span aria-hidden="true">→</span></button></div>
+                        <div class="aseo-wizard-actions"><button type="button" id="aseo-preview-brief" class="aseo-btn aseo-wizard-next">2. Xem dàn ý</button><label class="aseo-create-control"><span>Sau khi chấp nhận ảnh</span><select name="aseo_post_status_run"><option value="draft" selected>Giữ bản nháp</option><option value="publish">Tự động xuất bản</option></select></label><button type="submit" class="aseo-btn aseo-btn-run">3. Tạo danh sách bài <span aria-hidden="true">→</span></button></div>
                     </form>
                 </div>
 
                 <section class="aseo-image-stage-panel" id="aseo-image-stage">
                     <div class="aseo-image-stage-head">
                         <div>
-                            <h3>Giai đoạn 2 — Xem trước và xác nhận bài viết</h3>
-                            <p>Đây chỉ hiển thị nội dung của lượt vừa tạo, không lấy các bài cũ. Đọc xong rồi mới xác nhận tạo ảnh và hoàn tất bài.</p>
+                            <h3>Giai đoạn 2 — Chọn bài viết để tạo ảnh</h3>
+                            <p>API ảnh chưa chạy ở bước tạo nội dung. Chọn một bài bên dưới rồi bấm “Tạo ảnh”.</p>
                         </div>
                         <div class="aseo-image-stage-tools">
                             <label class="aseo-image-ratio-control">
@@ -1859,7 +2080,7 @@ class Agent_SEO_Settings {
                                     <option value="1:1" <?php selected($image_aspect_ratio, '1:1'); ?>>1:1 — Hình vuông</option>
                                 </select>
                             </label>
-                            <span class="aseo-stage-two-badge">DUYỆT BÀI → TẠO ẢNH</span>
+                            <span class="aseo-stage-two-badge">CHỌN BÀI → TẠO ẢNH</span>
                         </div>
                     </div>
                     <?php
@@ -1875,16 +2096,18 @@ class Agent_SEO_Settings {
                     }
                     ?>
                     <?php if (!empty($stage_posts)) :
+                        $stage_waiting_items = array();
                         $stage_review_items = array();
                         $stage_running_items = array();
                         $stage_done_items = array();
                         $stage_other_items = array();
                         foreach ($stage_posts as $stage_item_post) {
                             $stage_item_id = absint($stage_item_post->ID);
-                            $stage_item_awaiting = get_post_meta($stage_item_id, '_agent_seo_awaiting_image_approval', true) === '1';
                             $stage_item_featured = absint(get_post_thumbnail_id($stage_item_id));
                             $stage_item_job = get_post_meta($stage_item_id, '_agent_seo_image_job', true);
-                            $stage_item_running = !$stage_item_awaiting
+                            $stage_item_waiting = get_post_meta($stage_item_id, '_agent_seo_awaiting_image_approval', true) === '1';
+                            $stage_item_approved = get_post_meta($stage_item_id, '_agent_seo_image_approved', true) === '1';
+                            $stage_item_running = !$stage_item_waiting
                                 && !$stage_item_featured
                                 && is_array($stage_item_job)
                                 && !empty($stage_item_job['prompt']);
@@ -1892,90 +2115,144 @@ class Agent_SEO_Settings {
                                 'post' => $stage_item_post,
                                 'id' => $stage_item_id,
                                 'featured_id' => $stage_item_featured,
-                                'edit_url' => get_edit_post_link($stage_item_id)
+                                'edit_url' => get_edit_post_link($stage_item_id),
+                                'view_url' => $stage_item_post->post_status === 'publish'
+                                    ? get_permalink($stage_item_id)
+                                    : get_preview_post_link($stage_item_id)
                             );
-                            if ($stage_item_awaiting) {
+                            if ($stage_item_waiting && !$stage_item_featured) {
+                                $stage_waiting_items[] = $stage_item;
+                            } elseif ($stage_item_featured && !$stage_item_approved) {
                                 $stage_review_items[] = $stage_item;
                             } elseif ($stage_item_running) {
                                 $stage_running_items[] = $stage_item;
-                            } elseif ($stage_item_featured) {
+                            } elseif ($stage_item_featured && $stage_item_approved) {
                                 $stage_done_items[] = $stage_item;
                             } else {
                                 $stage_other_items[] = $stage_item;
                             }
                         }
-                        $focus_item = !empty($stage_review_items)
-                            ? $stage_review_items[0]
-                            : (!empty($stage_running_items)
-                                ? $stage_running_items[0]
-                                : (!empty($stage_done_items) ? $stage_done_items[0] : $stage_other_items[0]));
                         $focus_is_review = !empty($stage_review_items);
-                        $focus_is_running = !$focus_is_review && !empty($stage_running_items);
-                        $focus_is_done = !$focus_is_review && !$focus_is_running && !empty($stage_done_items);
-                        $focus_post = $focus_item['post'];
-                        $focus_post_id = $focus_item['id'];
+                        if ($focus_is_review) {
+                            $focus_item = $stage_review_items[0];
+                            $focus_review_position = 1;
+                            $requested_review_id = isset($_GET['aseo_review_post']) ? absint($_GET['aseo_review_post']) : 0;
+                            if ($requested_review_id > 0) {
+                                foreach ($stage_review_items as $candidate_review_index => $candidate_review_item) {
+                                    if ($candidate_review_item['id'] === $requested_review_id) {
+                                        $focus_item = $candidate_review_item;
+                                        $focus_review_position = $candidate_review_index + 1;
+                                        break;
+                                    }
+                                }
+                            }
+                            $focus_post = $focus_item['post'];
+                            $focus_post_id = $focus_item['id'];
+                        }
                     ?>
                     <div class="aseo-stage-queue-summary">
-                        <?php if (count($stage_review_items) > 0) : ?><span class="is-review"><?php echo esc_html(count($stage_review_items)); ?> bài chờ duyệt</span><?php endif; ?>
+                        <?php if (count($stage_waiting_items) > 0) : ?><span><?php echo esc_html(count($stage_waiting_items)); ?> bài chưa tạo ảnh</span><?php endif; ?>
+                        <?php if (count($stage_review_items) > 0) : ?><span class="is-review"><?php echo esc_html(count($stage_review_items)); ?> ảnh chờ chấp nhận</span><?php endif; ?>
                         <?php if (count($stage_running_items) > 0) : ?><span class="is-running"><?php echo esc_html(count($stage_running_items)); ?> ảnh đang tạo</span><?php endif; ?>
-                        <?php if (count($stage_done_items) > 0) : ?><span class="is-done"><?php echo esc_html(count($stage_done_items)); ?> ảnh đã xong</span><?php endif; ?>
+                        <?php if (count($stage_done_items) > 0) : ?><span class="is-done"><?php echo esc_html(count($stage_done_items)); ?> ảnh đã chấp nhận</span><?php endif; ?>
+                    </div>
+                    <?php if (count($stage_waiting_items) > 0) : ?>
+                        <div class="aseo-bulk-image-actions"><button type="button" class="button button-primary" id="aseo-generate-all-images" data-count="<?php echo esc_attr(count($stage_waiting_items)); ?>">⚡ Tạo tất cả ảnh (<?php echo esc_html(count($stage_waiting_items)); ?>)</button><span id="aseo-bulk-image-feedback" aria-live="polite">Tạo lần lượt từng ảnh trong nền.</span></div>
+                    <?php endif; ?>
+                    <div class="aseo-stage-article-list">
+                        <?php foreach ($stage_posts as $stage_index => $stage_list_post) :
+                            $stage_list_id = absint($stage_list_post->ID);
+                            $stage_list_featured = absint(get_post_thumbnail_id($stage_list_id));
+                            $stage_list_waiting = get_post_meta($stage_list_id, '_agent_seo_awaiting_image_approval', true) === '1';
+                            $stage_list_approved = get_post_meta($stage_list_id, '_agent_seo_image_approved', true) === '1';
+                            $stage_list_job = get_post_meta($stage_list_id, '_agent_seo_image_job', true);
+                            $stage_list_running = !$stage_list_waiting
+                                && !$stage_list_featured
+                                && is_array($stage_list_job)
+                                && !empty($stage_list_job['prompt']);
+                            if ($stage_list_waiting) {
+                                $stage_list_status = 'Chưa tạo ảnh';
+                            } elseif ($stage_list_running) {
+                                $stage_list_status = 'Đang tạo ảnh';
+                            } elseif ($stage_list_featured && !$stage_list_approved) {
+                                $stage_list_status = 'Ảnh chờ chấp nhận';
+                            } elseif ($stage_list_featured && $stage_list_approved) {
+                                $stage_list_status = 'Ảnh đã chấp nhận';
+                            } else {
+                                $stage_list_status = 'Chưa có ảnh';
+                            }
+                        ?>
+                        <div class="aseo-stage-article-row<?php echo $stage_list_running ? ' is-generating' : ''; ?>" data-post-id="<?php echo esc_attr($stage_list_id); ?>">
+                            <div class="aseo-stage-article-row-thumb">
+                                <?php if ($stage_list_featured) : ?>
+                                    <img src="<?php echo esc_url(wp_get_attachment_image_url($stage_list_featured, 'thumbnail')); ?>" alt="">
+                                <?php else : ?>
+                                    <?php echo esc_html($stage_index + 1); ?>
+                                <?php endif; ?>
+                            </div>
+                            <div class="aseo-stage-article-row-copy">
+                                <strong><?php echo esc_html($stage_list_post->post_title); ?></strong>
+                                <span class="<?php echo $stage_list_running ? 'aseo-image-work-status is-running' : ''; ?>"><?php echo esc_html($stage_list_status); ?></span>
+                            </div>
+                            <div class="aseo-stage-article-row-actions">
+                                <button type="button" class="button aseo-preview-article" data-post-id="<?php echo esc_attr($stage_list_id); ?>">Xem bài</button>
+                                <?php if ($stage_list_waiting) : ?>
+                                    <button type="button" class="button button-primary aseo-retry-image" data-create-image="1" data-post-id="<?php echo esc_attr($stage_list_id); ?>">Tạo ảnh</button>
+                                <?php elseif ($stage_list_running) : ?>
+                                    <button type="button" class="button" disabled>Đang tạo…</button>
+                                <?php elseif ($stage_list_featured && !$stage_list_approved) : ?>
+                                    <a href="<?php echo esc_url(add_query_arg('aseo_review_post', $stage_list_id, admin_url('admin.php?page=agent-seo-settings')) . '#aseo-image-review-current'); ?>" class="button">Duyệt ảnh</a>
+                                <?php elseif (!$stage_list_featured) : ?>
+                                    <button type="button" class="button button-primary aseo-retry-image" data-post-id="<?php echo esc_attr($stage_list_id); ?>">Tạo lại ảnh</button>
+                                <?php endif; ?>
+                            </div>
+                        </div>
+                        <?php endforeach; ?>
                     </div>
 
                     <?php if ($focus_is_review) : ?>
-                    <article class="aseo-draft-review-card">
-                        <div class="aseo-draft-review-head">
-                            <strong><?php echo esc_html($focus_post->post_title); ?></strong>
-                            <span class="aseo-image-work-status">Bài <?php echo esc_html(1 . '/' . count($stage_review_items)); ?> đang chờ xác nhận</span>
+                    <article class="aseo-image-review-card" id="aseo-image-review-current">
+                        <div class="aseo-image-review-visual">
+                            <img src="<?php echo esc_url(wp_get_attachment_image_url($focus_item['featured_id'], 'large')); ?>" alt="">
                         </div>
-                        <div class="aseo-draft-preview">
-                            <?php echo wp_kses_post(apply_filters('the_content', $focus_post->post_content)); ?>
+                        <div class="aseo-image-review-info">
+                            <span class="aseo-image-work-status">Ảnh <?php echo esc_html($focus_review_position . '/' . count($stage_review_items)); ?> chờ xác nhận</span>
+                            <h4><?php echo esc_html($focus_post->post_title); ?></h4>
+                            <p>Ảnh ổn thì chấp nhận. Nếu chưa ổn, nhập yêu cầu sửa rồi tạo phiên bản mới.</p>
+                            <div class="aseo-image-review-actions">
+                                <button type="button" class="button button-primary aseo-accept-image" data-post-id="<?php echo esc_attr($focus_post_id); ?>">✓ Chấp nhận ảnh này</button>
+                                <textarea class="aseo-image-edit-prompt" placeholder="Ví dụ: giữ nguyên sản phẩm, đổi nền sáng hơn, bỏ người phía sau..."><?php echo esc_textarea(get_post_meta($focus_post_id, '_agent_seo_last_image_edit_instruction', true)); ?></textarea>
+                                <button type="button" class="button aseo-retry-image aseo-edit-image" data-edit-image="1" data-post-id="<?php echo esc_attr($focus_post_id); ?>">Sửa ảnh theo prompt</button>
+                                <span class="aseo-image-action-feedback" aria-live="polite"></span>
+                                <button type="button" class="button aseo-preview-article" data-post-id="<?php echo esc_attr($focus_post_id); ?>">Xem bài viết</button>
+                            </div>
                         </div>
-                        <div class="aseo-draft-review-actions">
-                            <a href="<?php echo esc_url($focus_item['edit_url']); ?>" target="_blank" class="button">Cần sửa? Mở trình chỉnh sửa</a>
-                            <button type="button" class="button button-primary aseo-retry-image" data-review-approval="1" data-post-id="<?php echo esc_attr($focus_post_id); ?>">Xác nhận bài này — Bắt đầu tạo ảnh</button>
-                        </div>
-                        <?php if (count($stage_review_items) > 1) : ?>
-                            <p class="aseo-next-review-note">Duyệt xong bài này, hệ thống sẽ chuyển sang bài tiếp theo.</p>
-                        <?php endif; ?>
                     </article>
                     <?php else : ?>
-                    <article class="aseo-image-work-card aseo-image-work-card-focus">
-                        <div>
-                            <?php if (!empty($focus_item['featured_id'])) : ?>
-                                <img class="aseo-image-work-thumb" src="<?php echo esc_url(wp_get_attachment_image_url($focus_item['featured_id'], 'medium')); ?>" alt="">
-                            <?php else : ?>
-                                <div class="aseo-image-work-empty">Chưa tạo ảnh</div>
-                            <?php endif; ?>
-                        </div>
-                        <div class="aseo-image-work-info">
-                            <strong><?php echo esc_html($focus_post->post_title); ?></strong>
-                            <?php if ($focus_is_running) : ?>
-                                <span class="aseo-image-work-status is-running">Đang tạo ảnh</span>
-                                <span class="aseo-image-work-note">Worker đang chạy nền. Trang sẽ tự cập nhật khi hoàn tất.</span>
-                            <?php elseif ($focus_is_done) : ?>
-                                <span class="aseo-image-work-status is-done">Ảnh đã hoàn tất</span>
-                                <span class="aseo-image-work-note">Nhập yêu cầu bên cạnh nếu muốn sửa ảnh.</span>
-                            <?php else : ?>
-                                <span class="aseo-image-work-status">Chưa có ảnh</span>
-                            <?php endif; ?>
-                        </div>
-                        <div class="aseo-image-work-actions">
-                            <?php if ($focus_is_running) : ?>
-                                <button type="button" class="button" disabled>Đang xử lý ảnh…</button>
-                            <?php elseif ($focus_is_done) : ?>
-                                <textarea class="aseo-image-edit-prompt" placeholder="Yêu cầu sửa ảnh: giữ nguyên sản phẩm, đổi nền sáng hơn..."><?php echo esc_textarea(get_post_meta($focus_post_id, '_agent_seo_last_image_edit_instruction', true)); ?></textarea>
-                                <button type="button" class="button button-primary aseo-retry-image aseo-edit-image" data-edit-image="1" data-post-id="<?php echo esc_attr($focus_post_id); ?>">Sửa ảnh theo prompt</button>
-                            <?php else : ?>
-                                <button type="button" class="button button-primary aseo-retry-image" data-post-id="<?php echo esc_attr($focus_post_id); ?>">Tạo ảnh cho bài này</button>
-                            <?php endif; ?>
-                            <a href="<?php echo esc_url($focus_item['edit_url']); ?>" target="_blank" class="button">Mở bài viết</a>
-                        </div>
-                    </article>
+                        <div class="aseo-image-stage-empty"><?php echo !empty($stage_running_items)
+                            ? 'Ảnh đang được tạo. Bạn có thể tiếp tục chọn bài khác trong danh sách hoặc chờ ảnh hoàn tất.'
+                            : (!empty($stage_waiting_items)
+                                ? 'Chọn bài trong danh sách và bấm “Tạo ảnh”. API ảnh chỉ chạy cho bài bạn chọn.'
+                                : 'Toàn bộ ảnh trong lượt này đã được xử lý.'); ?></div>
                     <?php endif; ?>
                     <?php else : ?>
-                        <div class="aseo-image-stage-empty">Chưa có nội dung để xem trước. Hãy bấm “Tạo nội dung nháp” ở giai đoạn 1; khi AI viết xong, toàn bộ bài sẽ xuất hiện tại đây để bạn kiểm tra.</div>
+                        <div class="aseo-image-stage-empty">Chưa có bài trong lượt hiện tại. Hãy tạo nội dung ở Giai đoạn 1; danh sách bài sẽ xuất hiện tại đây.</div>
                     <?php endif; ?>
                 </section>
+                <div class="aseo-article-modal" id="aseo-article-modal" aria-hidden="true">
+                    <div class="aseo-article-modal-backdrop" data-close-article-modal></div>
+                    <div class="aseo-article-modal-dialog" role="dialog" aria-modal="true" aria-labelledby="aseo-article-modal-title">
+                        <div class="aseo-article-modal-head">
+                            <h3 id="aseo-article-modal-title">Xem trước bài viết</h3>
+                            <button type="button" class="aseo-article-modal-close" data-close-article-modal aria-label="Đóng popup">×</button>
+                        </div>
+                        <div class="aseo-article-modal-body" id="aseo-article-modal-body"></div>
+                        <div class="aseo-article-modal-foot">
+                            <a href="#" target="_blank" class="button" id="aseo-article-modal-view">Mở trang xem trước</a>
+                            <a href="#" target="_blank" class="button button-primary" id="aseo-article-modal-edit">Mở trình chỉnh sửa</a>
+                        </div>
+                    </div>
+                </div>
 
                 <div class="aseo-guide" aria-label="Hướng dẫn tạo bài">
                     <a class="aseo-guide-step" href="#aseo-create-section">
@@ -1985,7 +2262,7 @@ class Agent_SEO_Settings {
                         <b class="aseo-guide-number">2</b><span><strong>Duyệt dàn ý</strong><span>Xem hướng triển khai trước khi AI viết.</span></span>
                     </a>
                     <a class="aseo-guide-step" href="#aseo-progress-card">
-                        <b class="aseo-guide-number">3</b><span><strong>Tạo & kiểm tra</strong><span>Bài được lưu nháp, ảnh chạy nền.</span></span>
+                        <b class="aseo-guide-number">3</b><span><strong>Chọn tạo ảnh</strong><span>Bài được lưu nháp; ảnh chỉ chạy khi bạn bấm nút.</span></span>
                     </a>
                 </div>
 
@@ -2427,7 +2704,9 @@ class Agent_SEO_Settings {
                                             <?php
                                             $awaiting_image_approval = get_post_meta($ai_post->ID, '_agent_seo_awaiting_image_approval', true) === '1';
                                             if ($awaiting_image_approval) {
-                                                echo '<span style="color:#92400e;font-weight:700;font-size:.78rem;display:block;margin-bottom:5px;">● Chờ duyệt nội dung</span>';
+                                                echo '<span style="color:#1d4ed8;font-weight:700;font-size:.78rem;display:block;margin-bottom:5px;">● Ảnh đang chờ khởi chạy</span>';
+                                            } elseif (has_post_thumbnail($ai_post->ID) && get_post_meta($ai_post->ID, '_agent_seo_image_approved', true) !== '1') {
+                                                echo '<span style="color:#92400e;font-weight:700;font-size:.78rem;display:block;margin-bottom:5px;">● Ảnh chờ chấp nhận</span>';
                                             }
                                             $indexnow_sent = get_post_meta($ai_post->ID, '_agent_seo_indexnow_sent_at', true);
                                             $gsc_connected = class_exists('Agent_SEO_GSC') && !empty(Agent_SEO_GSC::access_token());
@@ -2537,20 +2816,201 @@ class Agent_SEO_Settings {
                 syncImageEngineSettings();
             }
 
+            var imageStatusPollers = {};
+            function pollImageStatus(postId, feedback, triggerButton) {
+                if (!postId || imageStatusPollers[postId]) return;
+                var pollCount = 0;
+                function checkStatus() {
+                    pollCount++;
+                    var statusBody = new URLSearchParams();
+                    statusBody.append('action', 'agent_seo_image_status');
+                    statusBody.append('nonce', '<?php echo esc_js(wp_create_nonce('agent_seo_image_status')); ?>');
+                    statusBody.append('post_id', postId);
+                    fetch('<?php echo esc_url(admin_url('admin-ajax.php')); ?>', {
+                        method: 'POST',
+                        credentials: 'same-origin',
+                        headers: {'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8'},
+                        body: statusBody.toString()
+                    }).then(function(response) {
+                        return response.json();
+                    }).then(function(payload) {
+                        if (!payload.success) throw new Error('Không đọc được trạng thái ảnh.');
+                        var data = payload.data || {};
+                        if (feedback && data.message) feedback.textContent = data.message;
+                        if (data.status === 'review' || data.status === 'done') {
+                            delete imageStatusPollers[postId];
+                            if (feedback) feedback.textContent = '✓ Ảnh mới đã hoàn tất. Đang cập nhật giao diện…';
+                            window.setTimeout(function() { window.location.reload(); }, 500);
+                            return;
+                        }
+                        if (data.status === 'failed' || data.status === 'waiting') {
+                            delete imageStatusPollers[postId];
+                            if (feedback) feedback.textContent = data.message || 'Chưa thể tạo ảnh.';
+                            if (triggerButton) {
+                                triggerButton.disabled = false;
+                                triggerButton.classList.remove('is-queued');
+                                triggerButton.textContent = 'Tạo lại ảnh';
+                            }
+                            return;
+                        }
+                        if (pollCount < 180) {
+                            imageStatusPollers[postId] = window.setTimeout(checkStatus, 5000);
+                        } else {
+                            delete imageStatusPollers[postId];
+                            if (feedback) feedback.textContent = 'Ảnh vẫn đang xử lý nền. Bạn có thể rời trang và quay lại sau.';
+                        }
+                    }).catch(function() {
+                        if (pollCount < 180) {
+                            imageStatusPollers[postId] = window.setTimeout(checkStatus, 7000);
+                        } else {
+                            delete imageStatusPollers[postId];
+                        }
+                    });
+                }
+                imageStatusPollers[postId] = true;
+                window.setTimeout(checkStatus, 1200);
+            }
+            document.querySelectorAll('#aseo-image-stage .aseo-stage-article-row.is-generating[data-post-id]').forEach(function(row) {
+                pollImageStatus(row.getAttribute('data-post-id'), null, null);
+            });
+            var generateAllImagesButton = document.getElementById('aseo-generate-all-images');
+            var generateAllImagesFeedback = document.getElementById('aseo-bulk-image-feedback');
+            if (generateAllImagesButton) {
+                generateAllImagesButton.addEventListener('click', function() {
+                    var waitingButtons = Array.prototype.slice.call(document.querySelectorAll('#aseo-image-stage .aseo-retry-image[data-create-image="1"]:not(:disabled)'));
+                    if (!waitingButtons.length) {
+                        generateAllImagesButton.disabled = true;
+                        generateAllImagesButton.textContent = '✓ Đã xếp hàng toàn bộ ảnh';
+                        if (generateAllImagesFeedback) generateAllImagesFeedback.textContent = 'Không còn bài chờ tạo ảnh.';
+                        return;
+                    }
+                    generateAllImagesButton.disabled = true;
+                    generateAllImagesButton.textContent = '⚡ Đang xếp hàng ảnh…';
+                    if (generateAllImagesFeedback) generateAllImagesFeedback.textContent = 'Đang gửi ' + waitingButtons.length + ' yêu cầu, ảnh chạy nền lần lượt.';
+                    waitingButtons.forEach(function(imageButton, index) {
+                        window.setTimeout(function() { imageButton.click(); }, index * 450);
+                    });
+                });
+            }
+
+            var articleModal = document.getElementById('aseo-article-modal');
+            var articleModalTitle = document.getElementById('aseo-article-modal-title');
+            var articleModalBody = document.getElementById('aseo-article-modal-body');
+            var articleModalEdit = document.getElementById('aseo-article-modal-edit');
+            var articleModalView = document.getElementById('aseo-article-modal-view');
+            var articlePreviewCache = {};
+            function closeArticleModal() {
+                if (!articleModal) return;
+                articleModal.classList.remove('is-open');
+                articleModal.setAttribute('aria-hidden', 'true');
+                document.body.classList.remove('aseo-modal-open');
+            }
+            function renderArticlePreview(data) {
+                if (!articleModal || !articleModalTitle || !articleModalBody) return;
+                articleModalTitle.textContent = data.title || 'Xem trước bài viết';
+                articleModalBody.innerHTML = data.content || '<p>Bài viết chưa có nội dung.</p>';
+                if (articleModalEdit) {
+                    articleModalEdit.href = data.edit_url || '#';
+                    articleModalEdit.style.display = data.edit_url ? '' : 'none';
+                }
+                if (articleModalView) {
+                    articleModalView.href = data.view_url || '#';
+                    articleModalView.style.display = data.view_url ? '' : 'none';
+                }
+            }
+            document.querySelectorAll('.aseo-preview-article').forEach(function(button) {
+                button.addEventListener('click', function() {
+                    if (!articleModal || !articleModalBody || !articleModalTitle) return;
+                    var postId = button.getAttribute('data-post-id');
+                    if (!postId) return;
+                    articleModal.classList.add('is-open');
+                    articleModal.setAttribute('aria-hidden', 'false');
+                    document.body.classList.add('aseo-modal-open');
+                    articleModalTitle.textContent = 'Đang tải bài viết…';
+                    articleModalBody.innerHTML = '<div class="aseo-article-modal-loading">Đang tải nội dung…</div>';
+                    if (articlePreviewCache[postId]) {
+                        renderArticlePreview(articlePreviewCache[postId]);
+                        return;
+                    }
+                    var previewBody = new URLSearchParams();
+                    previewBody.append('action', 'agent_seo_preview_post');
+                    previewBody.append('nonce', '<?php echo esc_js(wp_create_nonce('agent_seo_preview_post')); ?>');
+                    previewBody.append('post_id', postId);
+                    fetch('<?php echo esc_url(admin_url('admin-ajax.php')); ?>', {
+                        method: 'POST',
+                        credentials: 'same-origin',
+                        headers: {'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8'},
+                        body: previewBody.toString()
+                    }).then(function(response) {
+                        return response.json();
+                    }).then(function(payload) {
+                        if (!payload.success) {
+                            throw new Error(payload.data && payload.data.message ? payload.data.message : 'Không tải được bài viết.');
+                        }
+                        articlePreviewCache[postId] = payload.data;
+                        renderArticlePreview(payload.data);
+                    }).catch(function(error) {
+                        articleModalTitle.textContent = 'Không thể mở bài viết';
+                        articleModalBody.innerHTML = '<div class="aseo-article-modal-loading"></div>';
+                        articleModalBody.querySelector('.aseo-article-modal-loading').textContent = error.message || 'Không tải được bài viết.';
+                    });
+                });
+            });
+            document.querySelectorAll('[data-close-article-modal]').forEach(function(control) {
+                control.addEventListener('click', closeArticleModal);
+            });
+            document.addEventListener('keydown', function(event) {
+                if (event.key === 'Escape' && articleModal && articleModal.classList.contains('is-open')) {
+                    closeArticleModal();
+                }
+            });
+
+            document.querySelectorAll('.aseo-accept-image').forEach(function(button) {
+                button.addEventListener('click', function() {
+                    var postId = button.getAttribute('data-post-id');
+                    if (!postId) return;
+                    button.disabled = true;
+                    button.textContent = 'Đang lưu xác nhận…';
+                    var body = new URLSearchParams();
+                    body.append('action', 'agent_seo_accept_image');
+                    body.append('nonce', '<?php echo esc_js(wp_create_nonce('agent_seo_accept_image')); ?>');
+                    body.append('post_id', postId);
+                    fetch('<?php echo esc_url(admin_url('admin-ajax.php')); ?>', {
+                        method: 'POST',
+                        credentials: 'same-origin',
+                        headers: {'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8'},
+                        body: body.toString()
+                    }).then(function(response) {
+                        return response.json();
+                    }).then(function(payload) {
+                        if (!payload.success) {
+                            throw new Error(payload.data && payload.data.message ? payload.data.message : 'Không thể chấp nhận ảnh.');
+                        }
+                        button.textContent = '✓ Đã chấp nhận — chuyển ảnh tiếp…';
+                        window.setTimeout(function() { window.location.reload(); }, 700);
+                    }).catch(function(error) {
+                        window.alert(error.message || 'Lỗi kết nối khi chấp nhận ảnh.');
+                        button.disabled = false;
+                        button.textContent = '✓ Chấp nhận ảnh này';
+                    });
+                });
+            });
+
             document.querySelectorAll('.aseo-retry-image').forEach(function(button) {
                 button.addEventListener('click', function() {
                     var postId = button.getAttribute('data-post-id');
                     if (!postId) return;
                     var originalButtonText = button.textContent;
                     var isEditImage = button.getAttribute('data-edit-image') === '1';
-                    var isReviewApproval = button.getAttribute('data-review-approval') === '1';
+                    var feedback = button.parentElement ? button.parentElement.querySelector('.aseo-image-action-feedback') : null;
                     var editPrompt = '';
                     if (isEditImage) {
-                        var editBox = button.closest('.aseo-image-edit-box') || button.closest('.aseo-image-work-actions');
+                        var editBox = button.closest('.aseo-image-review-actions, .aseo-image-edit-box, .aseo-image-work-actions');
                         var editPromptField = editBox ? editBox.querySelector('.aseo-image-edit-prompt') : null;
                         editPrompt = editPromptField ? editPromptField.value.trim() : '';
                         if (!editPrompt) {
                             window.alert('Hãy nhập yêu cầu cần sửa trên ảnh.');
+                            if (feedback) feedback.textContent = 'Hãy nhập yêu cầu cần sửa trên ảnh.';
                             if (editPromptField) editPromptField.focus();
                             return;
                         }
@@ -2558,6 +3018,7 @@ class Agent_SEO_Settings {
                     button.disabled = true;
                     button.classList.add('is-queued');
                     button.textContent = isEditImage ? '🎨 Đang sửa ảnh...' : '🎨 Đang vẽ ảnh AI...';
+                    if (feedback) feedback.textContent = isEditImage ? 'Đang gửi prompt sửa ảnh…' : 'Đang gửi yêu cầu tạo ảnh…';
                     var body = new URLSearchParams();
                     body.append('action', 'agent_seo_retry_image');
                     body.append('nonce', '<?php echo esc_js(wp_create_nonce('agent_seo_retry_image')); ?>');
@@ -2568,9 +3029,23 @@ class Agent_SEO_Settings {
                         .then(function(payload) {
                             if (payload.success) {
                                 if (payload.data && payload.data.queued) {
-                                    button.textContent = isReviewApproval ? '✓ Đã duyệt — chuyển bài tiếp…' : 'Đang tạo ảnh…';
+                                    button.textContent = 'Đang tạo ảnh…';
                                     button.classList.add('is-queued');
-                                    window.setTimeout(function() { window.location.reload(); }, isReviewApproval ? 900 : 30000);
+                                    if (feedback) feedback.textContent = 'Đã nhận yêu cầu. Worker ảnh đang chạy nền…';
+                                    var reviewCard = button.closest('.aseo-image-review-card');
+                                    if (reviewCard) reviewCard.classList.add('is-generating');
+                                    var acceptButton = reviewCard ? reviewCard.querySelector('.aseo-accept-image') : null;
+                                    if (acceptButton) acceptButton.disabled = true;
+                                    var articleRow = document.querySelector('#aseo-image-stage .aseo-stage-article-row[data-post-id="' + postId + '"]');
+                                    if (articleRow) {
+                                        articleRow.classList.add('is-generating');
+                                        var rowStatus = articleRow.querySelector('.aseo-stage-article-row-copy span');
+                                        if (rowStatus) {
+                                            rowStatus.className = 'aseo-image-work-status is-running';
+                                            rowStatus.textContent = 'Đang tạo ảnh';
+                                        }
+                                    }
+                                    pollImageStatus(postId, feedback, button);
                                     return;
                                 }
                                 button.textContent = '✓ Đã tạo xong';
@@ -2584,13 +3059,16 @@ class Agent_SEO_Settings {
                                     }
                                 }
                             } else {
-                                alert(payload.data && payload.data.message ? payload.data.message : 'Tạo ảnh thất bại');
+                                var errorMessage = payload.data && payload.data.message ? payload.data.message : 'Tạo ảnh thất bại';
+                                alert(errorMessage);
+                                if (feedback) feedback.textContent = errorMessage;
                                 button.textContent = originalButtonText;
                                 button.disabled = false;
                             }
                         })
                         .catch(function() {
                             alert('Lỗi kết nối khi gửi yêu cầu vẽ ảnh.');
+                            if (feedback) feedback.textContent = 'Lỗi kết nối khi gửi yêu cầu vẽ ảnh.';
                             button.textContent = originalButtonText;
                             button.disabled = false;
                         });
@@ -2740,9 +3218,7 @@ class Agent_SEO_Settings {
                 }
 
                 if (batch.status === 'complete') {
-                    progressLabel.textContent = batch.review_required_posts && batch.review_required_posts.length
-                        ? 'Nội dung đã sẵn sàng để duyệt'
-                        : 'Hoàn tất tạo bài';
+                    progressLabel.textContent = 'Danh sách bài đã sẵn sàng';
                     if (
                         !completionReloadQueued
                         && ['queued', 'running', 'waiting', 'images_pending'].indexOf(previousStatus) !== -1
@@ -2988,7 +3464,7 @@ class Agent_SEO_Settings {
                     if (!request) { briefChatInput.focus(); return; }
                     briefChatSubmit.disabled = true;
                     briefChatSubmit.textContent = 'AI đang phân tích...';
-                    if (briefChatStatus) briefChatStatus.textContent = 'Đang điền các trường bên dưới';
+                    if (briefChatStatus) briefChatStatus.textContent = 'Đang lấy thông tin website và chuẩn bị brief...';
                     var body = new URLSearchParams();
                     body.append('action', 'agent_seo_prepare_assistant');
                     body.append('nonce', '<?php echo esc_js(wp_create_nonce('agent_seo_prepare_assistant')); ?>');
@@ -3017,7 +3493,9 @@ class Agent_SEO_Settings {
                                 document.getElementById('aseo-brief-chat').appendChild(promptPreview);
                             }
                             promptPreview.innerHTML = '<strong>Prompt viết & ảnh đã sẵn sàng</strong><code>' + String(data.master_prompt || '').replace(/[&<>]/g, function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;'}[c];}) + '</code>';
-                            if (briefChatStatus) briefChatStatus.textContent = '✓ Đã chuẩn bị xong brief và prompt.';
+                            if (briefChatStatus) briefChatStatus.textContent = data.company_profile_refreshed
+                                ? '✓ Đã cập nhật thông tin website và chuẩn bị xong brief/prompt.'
+                                : '✓ Đã chuẩn bị xong brief/prompt (dùng thông tin doanh nghiệp đã lưu).';
                             var createSection = document.getElementById('aseo-create-section');
                             if (createSection) createSection.scrollIntoView({behavior:'smooth', block:'start'});
                         })
@@ -3027,6 +3505,15 @@ class Agent_SEO_Settings {
             }
             var briefPreviewButton = document.getElementById('aseo-preview-brief');
             var briefPreview = document.getElementById('aseo-outline-preview');
+            var briefFieldsPanel = document.getElementById('aseo-brief-fields');
+            var briefFieldsToggle = document.getElementById('aseo-toggle-brief-fields');
+            if (briefFieldsPanel && briefFieldsToggle) {
+                briefFieldsToggle.addEventListener('click', function() {
+                    var isCollapsed = briefFieldsPanel.classList.toggle('aseo-brief-fields-collapsed');
+                    briefFieldsToggle.setAttribute('aria-expanded', isCollapsed ? 'false' : 'true');
+                    briefFieldsToggle.textContent = isCollapsed ? 'Chỉnh sửa brief' : 'Thu gọn brief';
+                });
+            }
             var briefFields = {
                 topic: document.getElementById('aseo_article_topic'),
                 location: document.getElementById('aseo_article_location'),
@@ -3035,6 +3522,21 @@ class Agent_SEO_Settings {
                 instructions: document.getElementById('aseo_article_instructions'),
                 secondary: document.getElementById('aseo_article_secondary')
             };
+            var compactKeyword = document.getElementById('aseo-brief-compact-keyword');
+            function updateCompactKeyword() {
+                if (compactKeyword && briefFields.topic && document.activeElement !== compactKeyword) compactKeyword.value = briefFields.topic.value || '';
+            }
+            if (briefFields.topic) {
+                briefFields.topic.addEventListener('input', updateCompactKeyword);
+                updateCompactKeyword();
+            }
+            if (compactKeyword) {
+                compactKeyword.addEventListener('input', function() {
+                    if (!briefFields.topic) return;
+                    briefFields.topic.value = compactKeyword.value;
+                    briefFields.topic.dispatchEvent(new Event('input', {bubbles:true}));
+                });
+            }
             function syncArticleBrief() {
                 Object.keys(briefFields).forEach(function(key) {
                     var hidden = document.getElementById('aseo_article_' + key + '_run');
