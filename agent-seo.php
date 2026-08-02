@@ -55,6 +55,8 @@ add_action('plugins_loaded', 'agent_seo_init');
 
 function agent_seo_init() {
     Agent_SEO_GSC::register_hooks();
+    // Làm sạch metadata ảnh ngay khi người dùng upload vào Media Library.
+    Agent_SEO_Gemini_Image::register_hooks();
     // Khởi tạo trang cài đặt quản trị
     if (is_admin()) {
         new Agent_SEO_Settings();

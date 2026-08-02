@@ -299,6 +299,11 @@ Yêu cầu bài viết để chuẩn E-E-A-T của Google:
 
         $prompt .= "\nFINAL SEO SAFETY RULE: Keep the exact primary keyword \"{$keyword}\" to a maximum of 8-10 natural occurrences in the full HTML content. Use semantic variants afterward, avoid repeating it in every paragraph, table cell, CTA and product box, and never force a sentence just to increase keyword density.\n";
 
+        if (isset($brand_data['content_language']) && $brand_data['content_language'] === 'en') {
+            $prompt .= "\n\nENGLISH CONTENT MODE — HIGHEST PRIORITY: Generate the seo_title, meta_description, primary_keyword, secondary_keyword, slug and all article content in natural, professional English. The user interface and input fields may be Vietnamese, but the output article and SEO metadata must be English. Translate generic HTML labels, CTA text, table headings, FAQ headings and contact wording into English. Preserve brand names, product names, addresses, phone numbers, URLs and factual business data exactly as supplied. Do not translate URLs or invent English business facts.\n";
+            $prompt .= "Use the supplied topic and search intent as the article's subject. Do not output Vietnamese paragraphs, Vietnamese headings or Vietnamese SEO metadata except for proper names and unavoidable factual addresses. The image_prompt must remain in English.\n";
+        }
+
         $body = array(
             'contents' => array(
                 array(
@@ -408,7 +413,10 @@ Yêu cầu bài viết để chuẩn E-E-A-T của Google:
         // Bảo vệ cuối cho trường hợp AI tạo tiêu đề quá rộng, không đúng chủ đề riêng.
         // Khi không đủ dấu hiệu chủ đề trong tiêu đề, dùng chính chủ đề làm tiêu đề
         // thay vì lưu một bài có title và content lệch nhau.
-        if (!empty($article_topic) && !self::title_matches_article_topic($article['seo_title'], $article_topic)) {
+        // Với English mode, topic người dùng nhập có thể vẫn là tiếng Việt;
+        // không dùng fallback nguyên văn vì sẽ làm tiêu đề bị Việt hóa.
+        if ((!isset($brand_data['content_language']) || $brand_data['content_language'] !== 'en')
+            && !empty($article_topic) && !self::title_matches_article_topic($article['seo_title'], $article_topic)) {
             $article['seo_title'] = self::build_topic_title($article_topic);
         }
 
@@ -421,7 +429,10 @@ Yêu cầu bài viết để chuẩn E-E-A-T của Google:
             if (self::is_batch_stopped($batch_started_at)) {
                 return array('success' => false, 'message' => 'Tiến trình đã được người dùng dừng.');
             }
-            $expand_prompt = "Mở rộng HTML bài viết dưới đây thành khoảng 1200-1500 từ tiếng Việt. Giữ nguyên chủ đề, dữ liệu thực tế, từ khóa chính và các thông tin sản phẩm; không bịa thêm giá, chứng nhận hay địa chỉ. Bổ sung phân tích, ví dụ, quy trình, tiêu chí lựa chọn và FAQ liên quan. Giữ cấu trúc H2/H3, bảng, CTA hiện có; không thêm h1, markdown hay lời giải thích. Chỉ trả về HTML nội dung hoàn chỉnh.\n\nHTML hiện tại:\n" . $article['content'];
+            $expand_prompt = (isset($brand_data['content_language']) && $brand_data['content_language'] === 'en')
+                ? "Expand the following HTML article to approximately 1200-1500 English words. Keep the exact topic, factual data, primary keyword and product information; do not invent prices, certifications or addresses. Add useful analysis, examples, process details, selection criteria and relevant FAQs. Keep the existing H2/H3 structure, tables and CTA; do not add H1, Markdown or explanations. Return only the complete HTML content.\n\nCurrent HTML:\n"
+                : "Mở rộng HTML bài viết dưới đây thành khoảng 1200-1500 từ tiếng Việt. Giữ nguyên chủ đề, dữ liệu thực tế, từ khóa chính và các thông tin sản phẩm; không bịa thêm giá, chứng nhận hay địa chỉ. Bổ sung phân tích, ví dụ, quy trình, tiêu chí lựa chọn và FAQ liên quan. Giữ cấu trúc H2/H3, bảng, CTA hiện có; không thêm h1, markdown hay lời giải thích. Chỉ trả về HTML nội dung hoàn chỉnh.\n\nHTML hiện tại:\n";
+            $expand_prompt .= $article['content'];
             $expand_body = array(
                 'contents' => array(array('parts' => array(array('text' => $expand_prompt)))),
                 'generationConfig' => array('temperature' => 0.35, 'responseMimeType' => 'text/plain')
@@ -498,7 +509,27 @@ Yêu cầu bài viết để chuẩn E-E-A-T của Google:
         $content = (string) $content;
         $address = isset($brand_data['brand_address']) ? trim($brand_data['brand_address']) : '';
         $phone = isset($brand_data['brand_phone']) ? trim($brand_data['brand_phone']) : '';
-        $brand_name = isset($brand_data['brand_name']) ? trim($brand_data['brand_name']) : 'website chính thức';
+        $is_english = isset($brand_data['content_language']) && $brand_data['content_language'] === 'en';
+        $brand_name = isset($brand_data['brand_name']) ? trim($brand_data['brand_name']) : ($is_english ? 'the official website' : 'website chính thức');
+        if ($is_english) {
+            $english_placeholder = '(?:See contact information on the website|contact us on the website|check the website for the address|hotline available on the website)';
+            if ($address !== '' && !preg_match('/' . $english_placeholder . '/iu', $address)) {
+                $content = preg_replace('/(<strong>\s*Address\s*:\s*<\/strong>\s*)' . $english_placeholder . '/iu', '$1' . esc_html($address), $content);
+            } else {
+                $content = preg_replace('/\s*<li[^>]*>\s*<strong>\s*Address\s*:\s*<\/strong>\s*' . $english_placeholder . '\s*<\/li>\s*/iu', '', $content);
+            }
+            if ($phone !== '' && !preg_match('/' . $english_placeholder . '/iu', $phone)) {
+                $content = preg_replace('/(<strong>\s*(?:Hotline|Phone|WhatsApp|Zalo)\s*:\s*<\/strong>\s*)' . $english_placeholder . '/iu', '$1' . esc_html($phone), $content);
+            } else {
+                $content = preg_replace('/\s*<li[^>]*>\s*<strong>\s*(?:Hotline|Phone|WhatsApp|Zalo)\s*:\s*<\/strong>\s*' . $english_placeholder . '\s*<\/li>\s*/iu', '', $content);
+            }
+            $content = preg_replace('/\b' . $english_placeholder . '\b/iu', '', $content);
+            $backlink_url = esc_url_raw($backlink_url);
+            if ($backlink_url !== '' && !preg_match('/<a\b[^>]*href=["\']' . preg_quote($backlink_url, '/') . '["\']/iu', $content)) {
+                $content .= '<p>Learn more from <a href="' . esc_url($backlink_url) . '">' . esc_html($brand_name) . '</a>.</p>';
+            }
+            return $content;
+        }
         $placeholder = '(?:Xem thông tin liên hệ trên website|xem thông tin liên hệ trên website|liên hệ trên website|xem website để biết địa chỉ|hotline cập nhật trên website)';
 
         if ($address !== '' && !preg_match('/' . $placeholder . '/iu', $address)) {

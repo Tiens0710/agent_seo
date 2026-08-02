@@ -16,6 +16,7 @@ class Agent_SEO_Settings {
         add_action('wp_ajax_agent_seo_save_product', array($this, 'ajax_save_product'));
         add_action('wp_ajax_agent_seo_autosave_setting', array($this, 'ajax_autosave_setting'));
         add_action('wp_ajax_agent_seo_retry_image', array($this, 'ajax_retry_image'));
+        add_action('wp_ajax_agent_seo_import_article_image', array($this, 'ajax_import_article_image'));
         add_action('wp_ajax_agent_seo_retry_inline_image', array($this, 'ajax_retry_inline_image'));
         add_action('wp_ajax_agent_seo_accept_image', array($this, 'ajax_accept_image'));
         add_action('wp_ajax_agent_seo_preview_post', array($this, 'ajax_preview_post'));
@@ -279,6 +280,27 @@ class Agent_SEO_Settings {
         }
         update_option($field, $value);
         wp_send_json_success(array('field' => $field));
+    }
+
+    /** Nhập ảnh AI đã upload và chuẩn hóa theo từ khóa của bài viết. */
+    public function ajax_import_article_image() {
+        if (!current_user_can('manage_options')) {
+            wp_send_json_error(array('message' => 'Không có quyền truy cập.'), 403);
+        }
+        check_ajax_referer('agent_seo_import_article_image', 'nonce');
+        $post_id = isset($_POST['post_id']) ? absint($_POST['post_id']) : 0;
+        $attachment_id = isset($_POST['attachment_id']) ? absint($_POST['attachment_id']) : 0;
+        $post = $post_id ? get_post($post_id) : null;
+        if (!$post || $post->post_type !== 'post' || !$attachment_id || !wp_attachment_is_image($attachment_id)) {
+            wp_send_json_error(array('message' => 'Bài viết hoặc ảnh không hợp lệ.'), 400);
+        }
+        $result = Agent_SEO_Gemini_Image::prepare_attachment_for_post($attachment_id, $post_id);
+        if (is_wp_error($result)) {
+            wp_send_json_error(array('message' => $result->get_error_message()), 400);
+        }
+        set_post_thumbnail($post_id, $attachment_id);
+        update_post_meta($post_id, '_agent_seo_image_approved', '1');
+        wp_send_json_success(array('message' => 'Đã làm sạch metadata và đổi tên ảnh theo từ khóa SEO.', 'image' => $result));
     }
 
     public function ajax_retry_image() {
@@ -971,6 +993,8 @@ class Agent_SEO_Settings {
         if ($action === 'force_run') {
             $num_posts = isset($_POST['aseo_num_posts']) ? intval($_POST['aseo_num_posts']) : 1;
             $num_posts = max(1, min(10, $num_posts)); // Giới hạn tối đa 10 bài mỗi lượt để tránh quá tải
+            $content_language = isset($_POST['aseo_content_language'])
+                && sanitize_key($_POST['aseo_content_language']) === 'en' ? 'en' : 'vi';
             $existing_batch = get_option('aseo_batch_status', array());
             $active_states = array('queued', 'running', 'waiting', 'images_pending');
             $existing_status = is_array($existing_batch) && isset($existing_batch['status'])
@@ -1056,6 +1080,7 @@ class Agent_SEO_Settings {
                 'current' => 0,
                 'remaining' => $num_posts,
                 'requested_status' => $post_status,
+                'content_language' => $content_language,
                 'product_id' => $selected_product_id,
                 'run_topic' => $run_topic,
                 'run_brief' => implode("\n", $run_brief),
@@ -1078,7 +1103,7 @@ class Agent_SEO_Settings {
             add_settings_error(
                 'agent_seo_messages',
                 'run_queued',
-                'Đã xếp hàng <strong>' . $num_posts . ' bài viết</strong> để AI ' . $status_label . ' ở chế độ nền. Bạn có thể rời trang này; bài sẽ xuất hiện khi hoàn tất.',
+                'Đã xếp hàng <strong>' . $num_posts . ' bài viết ' . ($content_language === 'en' ? 'tiếng Anh' : 'tiếng Việt') . '</strong> để AI ' . $status_label . ' ở chế độ nền. Bạn có thể rời trang này; bài sẽ xuất hiện khi hoàn tất.',
                 'updated'
             );
         }
@@ -2204,7 +2229,7 @@ class Agent_SEO_Settings {
                             <label class="aseo-create-control"><span>Số bài</span>
                             <select name="aseo_num_posts"><option value="1">1 bài</option><option value="2">2 bài</option><option value="3">3 bài</option><option value="5">5 bài</option><option value="10">10 bài</option></select>
                         </label>
-                        <div class="aseo-wizard-actions"><button type="button" id="aseo-preview-brief" class="aseo-btn aseo-wizard-next">2. Xem dàn ý</button><label class="aseo-create-control"><span>Sau khi chấp nhận ảnh</span><select name="aseo_post_status_run"><option value="publish" selected>Tự động xuất bản</option><option value="draft">Giữ bản nháp</option></select></label><button type="submit" class="aseo-btn aseo-btn-run">3. Tạo danh sách bài <span aria-hidden="true">→</span></button></div>
+                        <div class="aseo-wizard-actions"><button type="button" id="aseo-preview-brief" class="aseo-btn aseo-wizard-next">2. Xem dàn ý</button><label class="aseo-create-control"><span>Sau khi chấp nhận ảnh</span><select name="aseo_post_status_run"><option value="publish" selected>Tự động xuất bản</option><option value="draft">Giữ bản nháp</option></select></label><button type="submit" name="aseo_content_language" value="vi" class="aseo-btn aseo-btn-run">3. Tạo bài tiếng Việt <span aria-hidden="true">→</span></button><button type="submit" name="aseo_content_language" value="en" class="aseo-btn aseo-btn-run aseo-btn-run-english">3. Tạo bài tiếng Anh <span aria-hidden="true">→</span></button></div>
                     </form>
                 </div>
 
@@ -2299,7 +2324,7 @@ class Agent_SEO_Settings {
                         <?php if (count($stage_done_items) > 0) : ?><span class="is-done"><?php echo esc_html(count($stage_done_items)); ?> ảnh đã chấp nhận</span><?php endif; ?>
                     </div>
                     <?php if (count($stage_waiting_items) > 0) : ?>
-                        <div class="aseo-bulk-image-actions"><button type="button" class="button button-primary" id="aseo-generate-all-images" data-count="<?php echo esc_attr(count($stage_waiting_items)); ?>">⚡ Tạo tất cả ảnh (<?php echo esc_html(count($stage_waiting_items)); ?>)</button><span id="aseo-bulk-image-feedback" aria-live="polite">Tạo lần lượt từng ảnh trong nền.</span></div>
+                        <div class="aseo-bulk-image-actions"><button type="button" class="button button-primary" id="aseo-generate-all-images" data-count="<?php echo esc_attr(count($stage_waiting_items)); ?>">⚡ Tạo tất cả ảnh theo chủ đề (<?php echo esc_html(count($stage_waiting_items)); ?>)</button><span id="aseo-bulk-image-feedback" aria-live="polite">Agent SEO sẽ lấy ngữ cảnh từng bài để tạo ảnh.</span></div>
                     <?php endif; ?>
                     <?php if (count($stage_review_items) > 0) : ?>
                         <div class="aseo-bulk-image-actions"><button type="button" class="button" id="aseo-accept-all-images" data-count="<?php echo esc_attr(count($stage_review_items)); ?>">✓ Duyệt tất cả ảnh (<?php echo esc_html(count($stage_review_items)); ?>)</button><span id="aseo-accept-all-feedback" aria-live="polite">Chỉ áp dụng cho ảnh đã tạo xong.</span></div>
@@ -2343,14 +2368,15 @@ class Agent_SEO_Settings {
                             </div>
                             <div class="aseo-stage-article-row-actions">
                                 <button type="button" class="button aseo-preview-article" data-post-id="<?php echo esc_attr($stage_list_id); ?>">Xem bài</button>
+                                <button type="button" class="button aseo-import-article-image" data-post-id="<?php echo esc_attr($stage_list_id); ?>">Nhập ảnh AI theo từ khóa</button>
                                 <?php if ($stage_list_waiting) : ?>
-                                    <button type="button" class="button button-primary aseo-retry-image" data-create-image="1" data-post-id="<?php echo esc_attr($stage_list_id); ?>">Tạo ảnh</button>
+                                    <button type="button" class="button button-primary aseo-retry-image" data-create-image="1" data-post-id="<?php echo esc_attr($stage_list_id); ?>">Tạo ảnh theo chủ đề</button>
                                 <?php elseif ($stage_list_running) : ?>
                                     <button type="button" class="button" disabled>Đang tạo…</button>
                                 <?php elseif ($stage_list_featured && !$stage_list_approved) : ?>
                                     <a href="#aseo-image-review-current-<?php echo esc_attr($stage_list_id); ?>" class="button">Duyệt ảnh</a>
                                 <?php elseif (!$stage_list_featured) : ?>
-                                    <button type="button" class="button button-primary aseo-retry-image" data-post-id="<?php echo esc_attr($stage_list_id); ?>">Tạo lại ảnh</button>
+                                    <button type="button" class="button button-primary aseo-retry-image" data-post-id="<?php echo esc_attr($stage_list_id); ?>">Tạo lại theo chủ đề</button>
                                 <?php endif; ?>
                             </div>
                         </div>
@@ -2508,11 +2534,11 @@ class Agent_SEO_Settings {
                                     </div>
                                     <?php endif; ?>
                                     <div class="aseo-field aseo-fg-full">
-                                        <label><span class="field-icon">📝</span> Ảnh minh họa trong nội dung</label>
-                                        <p class="desc">Tắt để bài hoàn tất nhanh hơn; ảnh đại diện vẫn được tạo bình thường.</p>
+                                        <label><span class="field-icon">📝</span> Ảnh minh họa theo chủ đề bài viết</label>
+                                        <p class="desc">Khi bật, Agent SEO sẽ tự đọc tiêu đề, nội dung và từ khóa để tạo rồi chèn thêm 1 ảnh minh họa vào thân bài sau khi tạo ảnh đại diện.</p>
                                         <label style="display:flex; align-items:center; gap:8px; font-weight:600;">
                                             <input type="checkbox" id="aseo_enable_inline_images" name="aseo_enable_inline_images" value="1" <?php checked($enable_inline_images, true); ?>>
-                                            Tạo thêm 1 ảnh minh họa trong thân bài
+                                            Tự tạo và chèn 1 ảnh theo chủ đề vào bài viết
                                         </label>
                                     </div>
                                     <div class="aseo-field aseo-fg-full">
@@ -3336,6 +3362,42 @@ class Agent_SEO_Settings {
                             button.textContent = 'Sửa ảnh phụ theo prompt';
                             if (feedback) feedback.textContent = error.message || 'Không thể sửa ảnh phụ.';
                         });
+                });
+            });
+
+            document.querySelectorAll('.aseo-import-article-image').forEach(function(button) {
+                button.addEventListener('click', function() {
+                    var postId = button.getAttribute('data-post-id');
+                    if (!postId || typeof wp === 'undefined' || !wp.media) return;
+                    var frame = wp.media({
+                        title: 'Chọn hoặc upload ảnh AI cho bài viết',
+                        button: {text: 'Làm sạch và dùng ảnh này'},
+                        library: {type: 'image'},
+                        multiple: false
+                    });
+                    frame.on('select', function() {
+                        var attachment = frame.state().get('selection').first().toJSON();
+                        button.disabled = true;
+                        button.textContent = 'Đang làm sạch ảnh…';
+                        var body = new URLSearchParams();
+                        body.append('action', 'agent_seo_import_article_image');
+                        body.append('nonce', '<?php echo esc_js(wp_create_nonce('agent_seo_import_article_image')); ?>');
+                        body.append('post_id', postId);
+                        body.append('attachment_id', attachment.id || 0);
+                        fetch('<?php echo esc_url(admin_url('admin-ajax.php')); ?>', {method: 'POST', credentials: 'same-origin', headers: {'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8'}, body: body.toString()})
+                            .then(function(response) { return response.json(); })
+                            .then(function(payload) {
+                                if (!payload.success) throw new Error(payload.data && payload.data.message ? payload.data.message : 'Không thể xử lý ảnh.');
+                                button.textContent = '✓ Đã nhập ảnh theo từ khóa';
+                                window.location.reload();
+                            })
+                            .catch(function(error) {
+                                button.disabled = false;
+                                button.textContent = 'Nhập ảnh AI theo từ khóa';
+                                window.alert(error.message);
+                            });
+                    });
+                    frame.open();
                 });
             });
 

@@ -8,6 +8,97 @@ defined('ABSPATH') || exit;
 class Agent_SEO_Gemini_Image {
 
     /**
+     * Đăng ký bộ lọc làm sạch mọi ảnh được upload vào WordPress.
+     */
+    public static function register_hooks() {
+        add_filter('wp_handle_upload_prefilter', array(__CLASS__, 'sanitize_uploaded_image'));
+    }
+
+    /**
+     * Làm sạch metadata AI/EXIF trước khi WordPress chuyển file vào uploads.
+     */
+    public static function sanitize_uploaded_image($file) {
+        if (empty($file['tmp_name']) || empty($file['type']) || strpos($file['type'], 'image/') !== 0) {
+            return $file;
+        }
+
+        // Không re-encode GIF để tránh làm hỏng ảnh động.
+        if ($file['type'] === 'image/gif' || !is_readable($file['tmp_name'])) {
+            return $file;
+        }
+
+        $image_data = @file_get_contents($file['tmp_name']);
+        $image_info = $image_data && function_exists('getimagesizefromstring')
+            ? @getimagesizefromstring($image_data) : false;
+        if (!$image_info || empty($image_info['mime'])) {
+            return $file;
+        }
+
+        $mime_to_ext = array('image/jpeg' => 'jpg', 'image/png' => 'png', 'image/webp' => 'webp');
+        if (!isset($mime_to_ext[$image_info['mime']])) {
+            return $file;
+        }
+
+        $clean_image = self::strip_image_metadata($image_data, $image_info['mime']);
+        if (!empty($clean_image['data']) && $clean_image['data'] !== $image_data) {
+            if (@file_put_contents($file['tmp_name'], $clean_image['data']) !== false) {
+                $file['type'] = $clean_image['mime'];
+                $file['size'] = strlen($clean_image['data']);
+                $file['name'] = sanitize_file_name($file['name']);
+            }
+        }
+
+        return $file;
+    }
+
+    /**
+     * Làm sạch và đổi tên một attachment theo ngữ cảnh bài viết.
+     */
+    public static function prepare_attachment_for_post($attachment_id, $post_id) {
+        $attachment_id = absint($attachment_id);
+        $post_id = absint($post_id);
+        $post = $post_id ? get_post($post_id) : null;
+        $path = $attachment_id ? get_attached_file($attachment_id) : '';
+        if (!$post || $post->post_type !== 'post' || !wp_attachment_is_image($attachment_id) || !$path || !is_readable($path)) {
+            return new WP_Error('agent_seo_invalid_image', 'Ảnh hoặc bài viết không hợp lệ.');
+        }
+
+        $data = @file_get_contents($path);
+        $info = $data && function_exists('getimagesizefromstring') ? @getimagesizefromstring($data) : false;
+        if (!$info || empty($info['mime'])) {
+            return new WP_Error('agent_seo_invalid_image_data', 'Không đọc được dữ liệu ảnh.');
+        }
+        $clean = self::strip_image_metadata($data, $info['mime']);
+        if (!empty($clean['data']) && $clean['data'] !== $data) {
+            @file_put_contents($path, $clean['data']);
+        }
+
+        $keyword = get_post_meta($post_id, 'rank_math_focus_keyword', true);
+        $keyword = is_string($keyword) ? trim(strtok($keyword, ',')) : '';
+        $base = sanitize_title($keyword !== '' ? $keyword : $post->post_title);
+        $base = $base !== '' ? $base : 'agent-seo-image';
+        $upload_dir = wp_upload_dir();
+        $extension = pathinfo($path, PATHINFO_EXTENSION);
+        $new_name = wp_unique_filename(dirname($path), $base . ($extension ? '.' . strtolower($extension) : '.jpg'));
+        $new_path = trailingslashit(dirname($path)) . $new_name;
+        if ($new_path !== $path && @rename($path, $new_path)) {
+            $path = $new_path;
+            $relative = ltrim(str_replace(trailingslashit($upload_dir['basedir']), '', $path), '/');
+            update_post_meta($attachment_id, '_wp_attached_file', $relative);
+        }
+
+        wp_update_post(array('ID' => $attachment_id, 'post_title' => sanitize_text_field($post->post_title)));
+        update_post_meta($attachment_id, '_wp_attachment_image_alt', sanitize_text_field($keyword !== '' ? $keyword : $post->post_title));
+        update_post_meta($attachment_id, '_agent_seo_metadata_cleaned', '1');
+        $metadata = wp_generate_attachment_metadata($attachment_id, $path);
+        if (!is_wp_error($metadata) && !empty($metadata)) {
+            wp_update_attachment_metadata($attachment_id, $metadata);
+        }
+
+        return array('id' => $attachment_id, 'url' => wp_get_attachment_url($attachment_id), 'name' => basename($path));
+    }
+
+    /**
      * Tỷ lệ ảnh dùng chung cho mọi bộ máy sinh ảnh.
      */
     private static function configured_aspect_ratio() {
@@ -69,7 +160,7 @@ class Agent_SEO_Gemini_Image {
         $url = 'https://generativelanguage.googleapis.com/v1beta/models/imagen-4.0-generate-001:predict?key=' . $api_key;
 
         // Bổ sung các từ khóa kỹ thuật nhiếp ảnh thương mại cao cấp sạch sẽ, ánh sáng ban ngày lạnh sạch
-        $enhanced_prompt = $prompt . ', authentic editorial documentary photography in a real-world environment appropriate to the brand, industry and location, scene and camera angle should vary by article topic, natural human activity, if a product reference is supplied preserve its exact package shape and dominant colors as the primary subject, cool-toned 6000K-6500K daylight, accurate white balance, clean whites and cool grays, true-to-life colors, soft non-yellow shadows, physically plausible materials, no generic packaging of another color, no warm golden-hour light, no yellow or orange cast, no yellow tint, no warm white balance, no amber cast, no golden hour, no warm beige/brown tones, no cinematic color grading, no dramatic advertising lighting, no glossy 3D render, no CGI, no generic AI stock photo, no invented text or logos.';
+        $enhanced_prompt = $prompt . ', authentic editorial documentary photography in a real-world environment appropriate to the brand, industry and location, scene and camera angle should vary by article topic, natural human activity, if a product reference is supplied preserve its exact package shape and dominant colors as the primary subject, bright well-exposed natural daylight, gentle fill light on the main subject, clear visible details, open shade or bright overcast light, cool-toned 6000K-6500K daylight, accurate white balance, clean whites and cool grays, true-to-life colors, soft light shadows, physically plausible materials, no underexposure, no crushed blacks, no dark muddy areas, no generic packaging of another color, no warm golden-hour light, no yellow or orange cast, no yellow tint, no warm white balance, no amber cast, no golden hour, no warm beige/brown tones, no cinematic color grading, no dramatic advertising lighting, no glossy 3D render, no CGI, no generic AI stock photo, no invented text or logos.';
 
         $body = array(
             'instances' => array(
@@ -327,7 +418,7 @@ class Agent_SEO_Gemini_Image {
         $reference_override = !empty($image_url)
             ? ' PRODUCT REFERENCE IS THE PRIMARY SUBJECT: preserve the exact package shape, label layout and dominant colors from the supplied reference image; show one clearly recognizable package in the foreground occupying about 35-50% of the frame. Background packages must be secondary and consistent. Never replace the reference with generic packaging or bags of another color.'
             : ' If no product reference is supplied, do not invent packaging that is not present in the article context.';
-        $lighting_override = $reference_override . ' FINAL HARD RULE: real soft natural daylight, open shade, cool overcast sky, or bright overcast light, cool white balance 6000K-6500K, clean whites and cool gray tones, realistic skin tones and soft physically accurate shadows. ABSOLUTELY NO yellow tint, yellow cast, orange cast, warm white balance, amber cast, golden-hour light, tungsten, amber filter, sepia, warm beige tones, cinematic color grading, glossy studio glow, CGI, 3D render or artificial AI lighting. Unedited documentary photograph from a real camera.';
+        $lighting_override = $reference_override . ' FINAL LIGHTING RULE: bright, properly exposed real soft natural daylight; use bright open shade, bright overcast daylight, or a well-lit window. Add gentle natural fill so the main subject, faces and product details are clearly visible. Preserve realistic highlights and soft physically accurate shadows; never make the scene gloomy. Cool white balance 6000K-6500K, clean whites and cool gray tones, realistic skin tones. ABSOLUTELY NO underexposure, crushed blacks, dark muddy shadows, yellow tint, yellow cast, orange cast, warm white balance, amber cast, golden-hour light, tungsten, amber filter, sepia, warm beige tones, cinematic color grading, glossy studio glow, CGI, 3D render or artificial AI lighting. Unedited bright documentary photograph from a real camera.';
         $ratio = self::configured_aspect_ratio();
         $body = array(
             'prompt' => preg_replace('/\s+/', ' ', trim($prompt . $lighting_override)),
@@ -501,7 +592,7 @@ class Agent_SEO_Gemini_Image {
         $url = 'https://ai.api.nvidia.com/v1/genai/black-forest-labs/flux.2-klein-4b';
 
         // Bổ sung các từ khóa kỹ thuật nhiếp ảnh thương mại cao cấp sạch sẽ, ánh sáng ban ngày lạnh sạch
-        $enhanced_prompt = $prompt . ', authentic editorial documentary photography in a real-world environment appropriate to the brand, industry and location, scene and camera angle should vary by article topic, natural human activity, if a product reference is supplied preserve its exact package shape and dominant colors as the primary subject, cool-toned 6000K-6500K daylight, accurate white balance, clean whites and cool grays, true-to-life colors, soft non-yellow shadows, no generic packaging of another color, no warm golden-hour light, no yellow or orange cast, no yellow tint, no warm white balance, no amber cast, no golden hour, no warm beige/brown tones, no cinematic color grading, no dramatic advertising lighting, no glossy 3D render, no CGI, no generic AI stock photo, no invented text or logos.';
+        $enhanced_prompt = $prompt . ', authentic editorial documentary photography in a real-world environment appropriate to the brand, industry and location, scene and camera angle should vary by article topic, natural human activity, if a product reference is supplied preserve its exact package shape and dominant colors as the primary subject, bright well-exposed natural daylight, gentle fill light on the main subject, clear visible details, cool-toned 6000K-6500K daylight, accurate white balance, clean whites and cool grays, true-to-life colors, soft light shadows, no underexposure, no crushed blacks, no dark muddy areas, no generic packaging of another color, no warm golden-hour light, no yellow or orange cast, no yellow tint, no warm white balance, no amber cast, no golden hour, no warm beige/brown tones, no cinematic color grading, no dramatic advertising lighting, no glossy 3D render, no CGI, no generic AI stock photo, no invented text or logos.';
 
         $ratio = self::configured_aspect_ratio();
         $body = array(
@@ -631,10 +722,23 @@ class Agent_SEO_Gemini_Image {
         }
         $mime_to_ext = array('image/jpeg' => 'jpg', 'image/png' => 'png', 'image/webp' => 'webp', 'image/gif' => 'gif');
         $mime_type = isset($mime_to_ext[$image_info['mime']]) ? $image_info['mime'] : 'image/jpeg';
+
+        // Re-encode ảnh trước khi upload để loại EXIF/XMP/IPTC/C2PA và các
+        // trường nhận diện nguồn AI mà nhà cung cấp có thể nhúng vào file.
+        // Đây cũng giúp file có một cấu trúc ảnh sạch, đồng nhất giữa các API.
+        $clean_image = self::strip_image_metadata($image_data, $mime_type);
+        if (!empty($clean_image['data'])) {
+            $image_data = $clean_image['data'];
+            $mime_type = $clean_image['mime'];
+        }
         $extension = isset($mime_to_ext[$mime_type]) ? $mime_to_ext[$mime_type] : 'jpg';
 
-        // Đặt tên file chuẩn SEO dựa trên tiêu đề bài viết
-        $filename = sanitize_title($title) . '-' . rand(1000, 9999) . '.' . $extension;
+        // Đặt tên file chuẩn SEO dựa trên từ khóa chính; fallback về tiêu đề.
+        // wp_unique_filename() xử lý cả trường hợp nhiều ảnh có cùng tiêu đề.
+        $base_name = sanitize_title(!empty($keyword) ? $keyword : $title);
+        $base_name = $base_name !== '' ? $base_name : 'agent-seo-image';
+        $upload_dir = wp_upload_dir();
+        $filename = wp_unique_filename($upload_dir['path'], $base_name . '.' . $extension);
 
         // Lưu file tạm thời vào thư mục upload
         $upload = wp_upload_bits($filename, null, $image_data);
@@ -645,7 +749,9 @@ class Agent_SEO_Gemini_Image {
         }
 
         $caption = 'Hình ảnh minh họa cho: ' . (!empty($keyword) ? $keyword : $title);
-        $description = 'Ảnh đại diện chất lượng cao được sinh bởi AI phục vụ bài viết: ' . $title . (!empty($keyword) ? ' (Tối ưu từ khóa: ' . $keyword . ')' : '');
+        // Không ghi nguồn tạo ảnh vào IPTC/description của attachment. Marker
+        // nội bộ vẫn được lưu bằng post meta bên dưới để plugin quản lý ảnh.
+        $description = 'Ảnh đại diện chất lượng cao phục vụ bài viết: ' . $title . (!empty($keyword) ? ' (Tối ưu từ khóa: ' . $keyword . ')' : '');
 
         // Tạo thông tin đính kèm (Attachment) trong CSDL
         $attachment = array(
@@ -686,5 +792,58 @@ class Agent_SEO_Gemini_Image {
             error_log('Agent SEO Sideload Error: ' . $attach_id->get_error_message());
             return false;
         }
+    }
+
+    /**
+     * Loại metadata khỏi bytes ảnh bằng cách đọc và ghi lại ảnh.
+     * Ưu tiên Imagick vì có thể strip toàn bộ profile; GD là fallback phổ biến
+     * trên các hosting WordPress không cài Imagick.
+     */
+    private static function strip_image_metadata($image_data, $mime_type) {
+        if (class_exists('Imagick')) {
+            try {
+                $image = new Imagick();
+                $image->readImageBlob($image_data);
+                $image->setIteratorIndex(0);
+                $image->stripImage();
+                $image->setImageFormat($mime_type === 'image/png' ? 'png' : ($mime_type === 'image/webp' ? 'webp' : 'jpeg'));
+                if ($mime_type === 'image/jpeg') {
+                    $image->setImageCompressionQuality(92);
+                }
+                $clean = $image->getImageBlob();
+                $image->clear();
+                $image->destroy();
+                if (!empty($clean)) {
+                    return array('data' => $clean, 'mime' => $mime_type === 'image/png' ? 'image/png' : ($mime_type === 'image/webp' ? 'image/webp' : 'image/jpeg'));
+                }
+            } catch (Exception $e) {
+                error_log('Agent SEO Image Metadata: Imagick cleanup failed: ' . $e->getMessage());
+            }
+        }
+
+        if (function_exists('imagecreatefromstring')) {
+            $source = @imagecreatefromstring($image_data);
+            if ($source) {
+                ob_start();
+                if ($mime_type === 'image/png' && function_exists('imagepng')) {
+                    imagealphablending($source, false);
+                    imagesavealpha($source, true);
+                    imagepng($source, null, 6);
+                } elseif ($mime_type === 'image/webp' && function_exists('imagewebp')) {
+                    imagewebp($source, null, 92);
+                } elseif (function_exists('imagejpeg')) {
+                    imagejpeg($source, null, 92);
+                    $mime_type = 'image/jpeg';
+                }
+                $clean = ob_get_clean();
+                imagedestroy($source);
+                if (!empty($clean)) {
+                    return array('data' => $clean, 'mime' => $mime_type);
+                }
+            }
+        }
+
+        // Không làm hỏng ảnh nếu máy chủ không có bộ giải mã ảnh.
+        return array('data' => $image_data, 'mime' => $mime_type);
     }
 }

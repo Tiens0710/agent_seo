@@ -869,6 +869,14 @@ class Agent_SEO_Orchestrator {
         // Lượt tạo thủ công có thể gửi một brief riêng. Chỉ dùng topic này cho
         // bài đầu tiên của batch; các bài tiếp theo vẫn lấy lần lượt từ hàng đợi.
         $active_batch = get_option('aseo_batch_status', array());
+        $same_batch = is_array($active_batch)
+            && $batch_started_at > 0
+            && isset($active_batch['started_at'])
+            && intval($active_batch['started_at']) === intval($batch_started_at);
+        $content_language = $same_batch
+            && isset($active_batch['content_language'])
+            && $active_batch['content_language'] === 'en' ? 'en' : 'vi';
+        $brand_data['content_language'] = $content_language;
         if (is_array($active_batch) && empty($active_batch['run_brief_used'])) {
             $run_topic = isset($active_batch['run_topic']) ? sanitize_text_field($active_batch['run_topic']) : '';
             $run_brief = isset($active_batch['run_brief']) ? sanitize_textarea_field($active_batch['run_brief']) : '';
@@ -1028,25 +1036,31 @@ class Agent_SEO_Orchestrator {
         }
 
         // Tiêu đề do AI tạo đã được tối ưu hóa tự nhiên và lồng ghép từ khóa sáng tạo.
-        $article['content'] = $this->ensure_rank_math_toc($article['content']);
+        $article['content'] = $this->ensure_rank_math_toc($article['content'], $content_language);
+
+        // English mode uses the English focus keyword returned by Gemini for all
+        // SEO metadata instead of mixing the Vietnamese cluster keyword into it.
+        $post_primary_keyword = !empty($article['primary_keyword'])
+            ? sanitize_text_field($article['primary_keyword']) : $primary_keyword;
 
         // Rank Math: meta description phải chứa nguyên văn primary keyword.
         // AI đôi khi viết mô tả hay nhưng bỏ quên cụm từ này, nên chuẩn hóa lại trước khi lưu WordPress.
         $article['meta_description'] = $this->ensure_primary_in_meta_description(
             isset($article['meta_description']) ? $article['meta_description'] : '',
-            $primary_keyword
+            $content_language === 'en' ? $post_primary_keyword : $primary_keyword
         );
 
         // Rank Math: Giữ từ khóa chính riêng biệt của bài viết làm từ khóa tập trung chính (để tránh trùng lặp)
         // và thêm từ khóa chính chung của cụm bài làm từ khóa phụ.
-        $post_primary_keyword = !empty($article['primary_keyword']) ? sanitize_text_field($article['primary_keyword']) : $primary_keyword;
         $rank_math_keywords_list = array($post_primary_keyword);
         
         $secondary_sources = array();
-        if (mb_strtolower($post_primary_keyword) !== mb_strtolower($primary_keyword)) {
+        if ($content_language !== 'en' && mb_strtolower($post_primary_keyword) !== mb_strtolower($primary_keyword)) {
             $secondary_sources[] = $primary_keyword;
         }
-        $secondary_sources[] = $brand_data['global_secondary_keywords'];
+        if ($content_language !== 'en') {
+            $secondary_sources[] = $brand_data['global_secondary_keywords'];
+        }
         $secondary_sources[] = isset($article['secondary_keyword']) ? $article['secondary_keyword'] : '';
         $max_secondary_keywords = 3;
         foreach ($secondary_sources as $secondary_source) {
@@ -1085,8 +1099,10 @@ class Agent_SEO_Orchestrator {
 
         // Slug phải chứa primary keyword exact-match để Rank Math không báo thiếu từ khóa trong URL.
         // Ghép thêm topic để mỗi bài trong cụm vẫn có slug riêng.
-        $primary_slug = sanitize_title($primary_keyword);
-        $topic_slug = sanitize_title($topic_keyword);
+        $primary_slug = $content_language === 'en'
+            ? sanitize_title(!empty($article['slug']) ? $article['slug'] : $article['seo_title'])
+            : sanitize_title($primary_keyword);
+        $topic_slug = $content_language === 'en' ? '' : sanitize_title($topic_keyword);
         $slug_seed = $primary_slug;
         if ($topic_slug !== '' && $topic_slug !== $primary_slug) {
             $slug_seed .= '-' . $topic_slug;
@@ -1138,7 +1154,7 @@ class Agent_SEO_Orchestrator {
                 // Yoast SEO Integration
                 '_yoast_wpseo_title'    => $article['seo_title'],
                 '_yoast_wpseo_metadesc' => $article['meta_description'],
-                '_yoast_wpseo_focuskw'  => $primary_keyword
+                '_yoast_wpseo_focuskw'  => $post_primary_keyword
             )
         );
 
@@ -1204,21 +1220,21 @@ class Agent_SEO_Orchestrator {
             : "If no product reference is supplied, do not invent packaging; focus on people, process, place, tools or outcome appropriate to the article.";
         $image_prompt = $base_image_prompt . "\n\nARTICLE CONTEXT (must guide the scene):\n"
             . "Title: " . $article['seo_title'] . "\n"
-            . "Primary keyword: " . $primary_keyword . "\n"
+            . "Primary keyword: " . $post_primary_keyword . "\n"
             . "Article subtopic: " . $topic_keyword . "\n"
             . "Summary: " . $article_context . "\n\n"
             . "SELECTED SHOT AND SCENE FOR VISUAL DIVERSITY: " . $selected_scene . ". Follow this camera distance and angle; do not revert to a generic warehouse medium shot. Adapt the scene naturally to the article topic and vary the composition across articles. "
             . "Use an environmental documentary shot with authentic human activity. " . $reference_instruction . " "
-            . "Use cool-toned 6000K-6500K daylight, crisp cool color temperature, accurate white balance, clean whites and cool grays, realistic true-to-life colors, and soft non-yellow shadows. "
+            . "Use bright, properly exposed natural daylight with gentle fill light on the main subject, clearly visible faces and product details, cool-toned 6000K-6500K daylight, crisp cool color temperature, accurate white balance, clean whites and cool grays, realistic true-to-life colors, and soft light shadows. Avoid underexposure, crushed blacks and dark muddy areas. "
             . "No warm golden light, yellow/orange cast, sunset, cinematic grading, dramatic advertising light, glossy 3D render, plastic CGI look, generic AI stock-photo composition, or random props. No readable text or newly invented logos.";
-        $image_prompt .= "\n\nFINAL LIGHTING OVERRIDE (must follow exactly): Photographed in real soft natural daylight, preferably open shade, cool overcast sky, or bright overcast window light. Cool white balance 6000K-6500K, crisp cool color temperature, clean neutral whites and cool grays, realistic skin tones, physically accurate shadows. ABSOLUTELY NO warm white balance, yellow tint, yellow cast, orange cast, golden-hour light, warm golden glow, tungsten light, amber filter, sepia, warm beige tones, cinematic teal-orange grade, glossy studio glow, CGI, or artificial AI lighting. The scene must look like an unedited documentary photograph taken with a real camera.";
+        $image_prompt .= "\n\nFINAL LIGHTING OVERRIDE (must follow exactly): Bright, properly exposed real soft natural daylight, preferably bright open shade, bright overcast daylight, or a well-lit window. Add gentle natural fill so the main subject, faces and product details are clearly visible; keep the scene airy and never gloomy. Cool white balance 6000K-6500K, crisp cool color temperature, clean neutral whites and cool grays, realistic skin tones, physically accurate soft shadows. ABSOLUTELY NO underexposure, crushed blacks, dark muddy shadows, warm white balance, yellow tint, yellow cast, orange cast, golden-hour light, warm golden glow, tungsten light, amber filter, sepia, warm beige tones, cinematic teal-orange grade, glossy studio glow, CGI, or artificial AI lighting. The scene must look like a bright unedited documentary photograph taken with a real camera.";
         $image_prompt .= "\n\nPRODUCT COMPOSITION OVERRIDE: The product is the clear hero subject, fully visible, upright and centered or placed on a clean rule-of-thirds position. Keep the entire package inside the frame with no cropping, distortion or blocked label. Any person must remain secondary, shown from the side or behind, with hands and body never covering the product. Avoid awkward crops, cut-off faces, oversized people, cluttered backgrounds and duplicate packages. Use a clean premium commercial composition suitable for a blog featured image.";
         
         $product_image = isset($brand_data['product_image']) ? $brand_data['product_image'] : '';
         $image_job = array(
             'prompt' => $image_prompt,
             'title' => $article['seo_title'],
-            'keyword' => $target_keyword,
+            'keyword' => $post_primary_keyword,
             'product_image' => $product_image,
             'product_image_id' => isset($brand_data['product_image_id']) ? absint($brand_data['product_image_id']) : 0
         );
@@ -1289,7 +1305,7 @@ class Agent_SEO_Orchestrator {
         return strlen($word_boundary) >= 30 ? $word_boundary : $short;
     }
 
-    private function ensure_rank_math_toc($content) {
+    private function ensure_rank_math_toc($content, $content_language = 'vi') {
         if (stripos($content, 'wp:rank-math/toc-block') !== false) {
             return $content;
         }
@@ -1327,8 +1343,9 @@ class Agent_SEO_Orchestrator {
         foreach ($toc_items as $toc_item) {
             $toc_list .= '<li><a href="#' . esc_attr($toc_item['id']) . '">' . esc_html($toc_item['title']) . '</a></li>';
         }
-        $toc = '<!-- wp:rank-math/toc-block {"title":"Mục lục bài viết"} -->'
-            . '<div class="wp-block-rank-math-toc-block agent-seo-toc"><p><strong>Mục lục bài viết</strong></p><nav><ul>'
+        $toc_title = $content_language === 'en' ? 'Table of Contents' : 'Mục lục bài viết';
+        $toc = '<!-- wp:rank-math/toc-block {"title":"' . esc_attr($toc_title) . '"} -->'
+            . '<div class="wp-block-rank-math-toc-block agent-seo-toc"><p><strong>' . esc_html($toc_title) . '</strong></p><nav><ul>'
             . $toc_list
             . '</ul></nav></div><!-- /wp:rank-math/toc-block -->';
         $first_paragraph_end = stripos($content, '</p>');
