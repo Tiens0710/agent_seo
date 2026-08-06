@@ -19,6 +19,7 @@ class Agent_SEO_Orchestrator {
         // Thêm lịch kiểm tra thay đổi chu kỳ Cron khi lưu cấu hình
         add_action('update_option_aseo_cron_interval', array($this, 'reschedule_cron_on_update'), 10, 2);
         add_action('transition_post_status', array($this, 'queue_index_notification'), 10, 3);
+        add_action('post_updated', array($this, 'queue_index_notification_on_update'), 10, 3);
         add_action('init', array($this, 'serve_indexnow_key'));
     }
 
@@ -40,11 +41,55 @@ class Agent_SEO_Orchestrator {
         if ($new_status !== 'publish' || $old_status === 'publish' || empty($post->ID) || $post->post_type !== 'post') {
             return;
         }
-        if (!get_post_meta($post->ID, '_agent_seo_generated', true)) {
+        $this->schedule_index_notification($post->ID);
+    }
+
+    /**
+     * Gửi lại tín hiệu index khi một bài đã publish được chỉnh sửa.
+     * Hook transition_post_status chỉ bắt lần chuyển sang publish, nên nếu
+     * chỉ dùng hook đó thì các lần cập nhật nội dung sau này sẽ không được
+     * thông báo cho IndexNow và sitemap sẽ không được submit lại.
+     */
+    public function queue_index_notification_on_update($post_id, $post_after, $post_before) {
+        $post_id = absint($post_id);
+        if (
+            $post_id <= 0
+            || !($post_after instanceof WP_Post)
+            || !($post_before instanceof WP_Post)
+            || $post_after->post_type !== 'post'
+            || $post_after->post_status !== 'publish'
+            || wp_is_post_revision($post_id)
+            || wp_is_post_autosave($post_id)
+        ) {
             return;
         }
+
+        if (
+            $post_after->post_modified_gmt === $post_before->post_modified_gmt
+            && $post_after->post_title === $post_before->post_title
+            && $post_after->post_content === $post_before->post_content
+        ) {
+            return;
+        }
+
+        $this->schedule_index_notification($post_id);
+    }
+
+    /** Xếp hàng IndexNow và submit lại sitemap cho bài Agent SEO đã publish. */
+    private function schedule_index_notification($post_id) {
+        $post_id = absint($post_id);
+        $post = $post_id ? get_post($post_id) : null;
+        if (
+            !$post
+            || $post->post_type !== 'post'
+            || $post->post_status !== 'publish'
+            || !get_post_meta($post_id, '_agent_seo_generated', true)
+        ) {
+            return;
+        }
+
         if (!wp_next_scheduled('agent_seo_index_notify_task', array($post->ID))) {
-            wp_schedule_single_event(time() + 10, 'agent_seo_index_notify_task', array($post->ID));
+            wp_schedule_single_event(time() + 10, 'agent_seo_index_notify_task', array($post_id));
         }
         if (!wp_next_scheduled('agent_seo_gsc_sitemap_task')) {
             wp_schedule_single_event(time() + 15, 'agent_seo_gsc_sitemap_task');
@@ -52,6 +97,7 @@ class Agent_SEO_Orchestrator {
     }
 
     public function notify_indexnow($post_id) {
+        $post_id = absint($post_id);
         $key = trim(get_option('aseo_indexnow_key', ''));
         $url = get_permalink($post_id);
         if (empty($key) || empty($url)) {
@@ -70,8 +116,14 @@ class Agent_SEO_Orchestrator {
         ));
         if (!is_wp_error($response) && in_array(wp_remote_retrieve_response_code($response), array(200, 202), true)) {
             update_post_meta($post_id, '_agent_seo_indexnow_sent_at', time());
+            delete_post_meta($post_id, '_agent_seo_indexnow_attempts');
         } else {
-            error_log('Agent SEO IndexNow notification failed for post ID ' . intval($post_id));
+            $attempts = intval(get_post_meta($post_id, '_agent_seo_indexnow_attempts', true)) + 1;
+            update_post_meta($post_id, '_agent_seo_indexnow_attempts', $attempts);
+            if ($attempts < 3 && !wp_next_scheduled('agent_seo_index_notify_task', array($post_id))) {
+                wp_schedule_single_event(time() + (60 * $attempts), 'agent_seo_index_notify_task', array($post_id));
+            }
+            error_log('Agent SEO IndexNow notification failed for post ID ' . $post_id . ' (attempt ' . $attempts . ').');
         }
     }
 
